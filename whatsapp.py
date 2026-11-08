@@ -123,6 +123,20 @@ async def translate_and_reply(recipient: str, text: str) -> None:
     await send_text(recipient, reply)
 
 
+def _error_summary(details: dict, recipient: str, text: str) -> str:
+    extra = details.get("error_data")
+    description = str(details.get("message") or "")
+    if isinstance(extra, dict):
+        description += " " + str(extra.get("details") or "")
+    private_values = (ACCESS_TOKEN, APP_SECRET.decode(), VERIFY_TOKEN.decode(),
+                      os.getenv("GEMINI_API_KEY", "").strip(), recipient, text)
+    for value in private_values:
+        if value:
+            description = description.replace(value, "[redacted]")
+    description = re.sub(r"\b[0-9]{6,}\b", "[id]", description)
+    return " ".join(description.split())[:500]
+
+
 async def send_text(recipient: str, text: str) -> None:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -142,7 +156,8 @@ async def send_text(recipient: str, text: str) -> None:
             logger.info("WhatsApp accepted the outgoing reply")
     except httpx.HTTPStatusError as error:
         details = response_error(error.response)
-        logger.error("Meta rejected the reply (HTTP %s, code %s, subcode %s)",
-                     error.response.status_code, details.get("code"), details.get("error_subcode"))
+        logger.error("Meta rejected the reply (HTTP %s, code %s, subcode %s): %s",
+                     error.response.status_code, details.get("code"), details.get("error_subcode"),
+                     _error_summary(details, recipient, text))
     except httpx.RequestError as error:
         logger.error("WhatsApp reply was not confirmed (%s)", type(error).__name__)

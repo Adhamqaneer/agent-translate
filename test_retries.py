@@ -227,18 +227,25 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((gemini_calls, whatsapp_calls), (2, 2))
         self.assertEqual(len(requests), 4)
 
-    async def test_meta_error_codes_are_logged_without_response_body(self):
+    async def test_meta_error_details_are_redacted(self):
         request = httpx.Request("POST", "https://graph.facebook.com/messages")
         response = httpx.Response(400, request=request, json={"error": {
-            "code": 100, "error_subcode": 33, "message": "private-response-body",
+            "code": 100, "error_subcode": 33,
+            "message": "Invalid parameter " + whatsapp.ACCESS_TOKEN + " " + os.environ["GEMINI_API_KEY"],
+            "error_data": {"details": "Bad recipient 962700000000, private-message-text, "
+                          + whatsapp.APP_SECRET.decode() + " " + whatsapp.VERIFY_TOKEN.decode()
+                          + " phone ID 123456789012345"},
         }})
         error = httpx.HTTPStatusError("private-request-details", request=request, response=response)
         with patch("whatsapp.post_with_retry", side_effect=error):
             with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                 await whatsapp.send_text("962700000000", "private-message-text")
         output = "\n".join(recorded.output)
-        self.assertIn("HTTP 400, code 100, subcode 33", output)
-        for private_value in ("private-response-body", "private-request-details", "private-message-text", "unit-test-token"):
+        for expected in ("HTTP 400, code 100, subcode 33", "Invalid parameter", "Bad recipient", "[redacted]", "[id]"):
+            self.assertIn(expected, output)
+        for private_value in ("private-request-details", "private-message-text", "962700000000",
+                              "123456789012345", whatsapp.ACCESS_TOKEN, whatsapp.APP_SECRET.decode(),
+                              whatsapp.VERIFY_TOKEN.decode(), os.environ["GEMINI_API_KEY"]):
             self.assertNotIn(private_value, output)
 
     async def test_translation_exhaustion_sends_one_fallback(self):
