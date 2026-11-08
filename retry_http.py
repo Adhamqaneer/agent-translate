@@ -20,7 +20,7 @@ GEMINI_CONNECTION_ERRORS = SAFE_CONNECTION_ERRORS + (
 )
 
 
-def _error_body(response: httpx.Response) -> dict:
+def response_error(response: httpx.Response) -> dict:
     try:
         body = response.json()
     except ValueError:
@@ -34,7 +34,7 @@ def _retryable_response(response: httpx.Response, service: str) -> bool:
         return response.status_code in {408, 429, 500, 502, 503, 504}
     if response.status_code < 400 or response.status_code in {401, 403}:
         return False
-    error = _error_body(response)
+    error = response_error(response)
     if error.get("code") == 190:
         return False
     # Retry explicit rejections, never an unstructured gateway/server failure:
@@ -67,7 +67,7 @@ def _retry_delay(response: httpx.Response | None, attempt: int, service: str) ->
     if response is None:
         return delays[0]
     delays.append(_seconds(response.headers.get("Retry-After"), allow_date=True))
-    error = _error_body(response)
+    error = response_error(response)
     if service == "whatsapp" and error.get("code") == 131056:
         delays.append(4 ** attempt)
     details = error.get("details", [])

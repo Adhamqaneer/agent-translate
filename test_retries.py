@@ -227,6 +227,20 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((gemini_calls, whatsapp_calls), (2, 2))
         self.assertEqual(len(requests), 4)
 
+    async def test_meta_error_codes_are_logged_without_response_body(self):
+        request = httpx.Request("POST", "https://graph.facebook.com/messages")
+        response = httpx.Response(400, request=request, json={"error": {
+            "code": 100, "error_subcode": 33, "message": "private-response-body",
+        }})
+        error = httpx.HTTPStatusError("private-request-details", request=request, response=response)
+        with patch("whatsapp.post_with_retry", side_effect=error):
+            with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
+                await whatsapp.send_text("962700000000", "private-message-text")
+        output = "\n".join(recorded.output)
+        self.assertIn("HTTP 400, code 100, subcode 33", output)
+        for private_value in ("private-response-body", "private-request-details", "private-message-text", "unit-test-token"):
+            self.assertNotIn(private_value, output)
+
     async def test_translation_exhaustion_sends_one_fallback(self):
         gemini_calls = 0
         whatsapp_payloads = []

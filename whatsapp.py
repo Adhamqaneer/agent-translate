@@ -9,7 +9,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
-from retry_http import post_with_retry
+from retry_http import post_with_retry, response_error
 from translator import translate_message
 
 
@@ -141,6 +141,8 @@ async def send_text(recipient: str, text: str) -> None:
             response.raise_for_status()
             logger.info("WhatsApp accepted the outgoing reply")
     except httpx.HTTPStatusError as error:
-        logger.error("Meta rejected the reply (HTTP %s)", error.response.status_code)
+        details = response_error(error.response)
+        logger.error("Meta rejected the reply (HTTP %s, code %s, subcode %s)",
+                     error.response.status_code, details.get("code"), details.get("error_subcode"))
     except httpx.RequestError as error:
         logger.error("WhatsApp reply was not confirmed (%s)", type(error).__name__)
