@@ -1,6 +1,5 @@
 # Local environment variables and credentials
 .env*
-!.env.example
 .secrets/
 
 # Python virtual environments

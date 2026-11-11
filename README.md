@@ -24,7 +24,6 @@ at the start of a message to select the output language explicitly.
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
 | `test_app.py` | Offline retry, pipeline, and webhook tests. |
 | `requirements.txt` | Pinned direct dependencies. |
-| `.env.example` | Configuration template without credentials. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
 
 ## Setup
@@ -37,11 +36,12 @@ In PowerShell, from the project directory:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+if (-not (Test-Path .env)) { New-Item -ItemType File -Path .env | Out-Null }
 notepad .env
 ```
 
-Fill in `.env` using the table below. Never commit it. Activation is optional
+Add one `NAME=value` line to `.env` for each setting in the table below.
+Keep this file local and never commit it. Activation is optional
 when running the virtual environment's Python executable directly.
 
 | Variable | Value |
