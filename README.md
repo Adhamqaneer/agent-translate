@@ -9,8 +9,9 @@ meaning, tone, names, numbers, and dates. Formal messages remain formal.
 WhatsApp -> Meta webhook -> FastAPI -> Gemini -> WhatsApp reply
 ```
 
-Only the configured sender's text messages are accepted. Questions and commands
-are translated as text, with no answers or extra commentary. Mixed input follows
+Only allowlisted senders' text messages are accepted. Each translation is
+returned to its sender. Questions and commands are translated as text, with no
+answers or extra commentary. Mixed input follows
 its main language; balanced mixed input defaults to English. Use `ar:` or `en:`
 at the start of a message to select the output language explicitly.
 
@@ -21,7 +22,7 @@ at the start of a message to select the output language explicitly.
 | `whatsapp.py` | Webhook routes, signature validation, sender filtering, and replies. |
 | `translator.py` | Prompt, Gemini translation, shared configuration, and CLI. |
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
-| `test_retries.py`, `test_webhook.py` | Offline retry, pipeline, and webhook tests. |
+| `test_app.py` | Offline retry, pipeline, and webhook tests. |
 | `requirements.txt` | Pinned direct dependencies. |
 | `.env.example` | Configuration template without credentials. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
@@ -47,15 +48,28 @@ when running the virtual environment's Python executable directly.
 | --- | --- |
 | `WA_ACCESS_TOKEN` | WhatsApp API access token authorized for the phone number. |
 | `WA_PHONE_NUMBER_ID` | Meta's phone number ID, not the displayed number. |
-| `WA_TEST_RECIPIENT` | Allowed sender and reply recipient: international digits without `+`, spaces, or a `00` dialing prefix. |
+| `WA_ALLOWED_SENDERS` | Comma-separated allowed sender numbers, including country codes. Optional leading `+` and spaces around entries are accepted; no internal spaces or `00` dialing prefix. |
 | `WA_GRAPH_VERSION` | Supported Graph API version selected for the Meta app, including `v`. |
 | `META_APP_SECRET` | Meta app secret for checking webhook signatures. |
 | `WA_VERIFY_TOKEN` | A secret you choose and enter identically in Meta's webhook form. |
 | `GEMINI_API_KEY` | Gemini API key. |
 | `GEMINI_MODEL` | Optional; defaults to `gemini-3.1-flash-lite`. |
 
-Restart the app after changing configuration or the prompt. Changing
-`WA_TEST_RECIPIENT` changes the one person who can use this version.
+To allow multiple people, set this in your local `.env` or the host's environment
+settings (these are example numbers):
+
+```dotenv
+WA_ALLOWED_SENDERS=962700000000,962700000001
+```
+
+Include every allowed sender in `WA_ALLOWED_SENDERS`. Add or remove
+comma-separated numbers and restart the app; no code changes are needed.
+This setting is required: startup fails if it is missing, blank, or invalid.
+When upgrading an older deployment, populate this list before deploying and
+remove the old recipient setting after the updated version is live.
+Numbers using Meta's test phone must also be added and verified in Meta's
+recipient list. Each person's messages and replies stay in their own chat.
+Restart the app after changing configuration or the prompt.
 
 ## Run locally
 
@@ -90,7 +104,8 @@ Run all tests without calling Gemini or sending WhatsApp messages:
 
 Tests use placeholder credentials and mocked HTTP transports. They cover retry
 limits and waits, permanent errors, uncertain sends, malformed responses,
-signature verification, sender filtering, batch validation, and `/health`.
+signature verification, sender configuration, per-sender reply routing,
+concurrent requests, batch validation, and `/health`.
 
 ## Reliability and scope
 
@@ -105,7 +120,7 @@ signature verification, sender filtering, batch validation, and `/health`.
 - Retrying a send reuses the translation. Translation failures produce a short
   fallback reply when possible. Logs report status codes and error types rather
   than message text or credentials. API acceptance does not confirm delivery.
-- This version handles one sender and text messages only. There is no database,
+- This version handles allowlisted senders and text messages only. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous
   translations when accuracy matters.

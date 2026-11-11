@@ -13,11 +13,19 @@ from retry_http import post_with_retry, response_error
 from translator import translate_message
 
 
+def _load_allowed_senders() -> frozenset[str]:
+    configured = os.getenv("WA_ALLOWED_SENDERS", "").strip()
+    senders = frozenset(number.strip().removeprefix("+") for number in configured.split(","))
+    if not all(re.fullmatch(r"[1-9][0-9]{6,14}", number) for number in senders):
+        raise RuntimeError("Set WA_ALLOWED_SENDERS to comma-separated international phone numbers, without spaces or a 00 prefix.")
+    return senders
+
+
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error.whatsapp")
 
 PHONE_ID = os.environ["WA_PHONE_NUMBER_ID"].strip()
-TEST_RECIPIENT = os.environ["WA_TEST_RECIPIENT"].strip().removeprefix("+")
+ALLOWED_SENDERS = _load_allowed_senders()
 VERSION = os.environ["WA_GRAPH_VERSION"].strip()
 ACCESS_TOKEN = os.environ["WA_ACCESS_TOKEN"].strip()
 APP_SECRET = os.environ["META_APP_SECRET"].strip().encode()
@@ -25,7 +33,6 @@ VERIFY_TOKEN = os.environ["WA_VERIFY_TOKEN"].strip().encode()
 
 if not (
     PHONE_ID.isascii() and PHONE_ID.isdecimal()
-    and TEST_RECIPIENT.isascii() and TEST_RECIPIENT.isdecimal()
     and re.fullmatch(r"v[0-9]+\.[0-9]+", VERSION)
     and ACCESS_TOKEN and APP_SECRET and VERIFY_TOKEN
 ):
@@ -55,7 +62,7 @@ async def verify_webhook(request: Request):
     return PlainTextResponse(challenge)
 
 
-def _incoming_texts(event: object) -> list[str]:
+def _incoming_texts(event: object) -> list[tuple[str, str]]:
     """Validate provider payload shapes before scheduling any outgoing work."""
     def as_object(value):
         if not isinstance(value, dict):
@@ -79,13 +86,14 @@ def _incoming_texts(event: object) -> list[str]:
                 continue
             for message in as_list(value.get("messages", [])):
                 message = as_object(message)
-                if message.get("type") != "text" or message.get("from") != TEST_RECIPIENT:
+                sender = message.get("from")
+                if message.get("type") != "text" or not isinstance(sender, str) or sender not in ALLOWED_SENDERS:
                     continue
                 text = as_object(message.get("text", {})).get("body", "")
                 if not isinstance(text, str):
                     raise ValueError("Expected webhook text")
                 if text.strip():
-                    texts.append(text)
+                    texts.append((sender, text))
     return texts
 
 
@@ -102,8 +110,8 @@ async def receive_webhook(request: Request, tasks: BackgroundTasks):
     except (ValueError, UnicodeError) as error:
         raise HTTPException(status_code=400, detail="Invalid webhook payload") from error
 
-    for text in texts:
-        tasks.add_task(translate_and_reply, TEST_RECIPIENT, text)
+    for sender, text in texts:
+        tasks.add_task(translate_and_reply, sender, text)
     return {"ok": True}
 
 
