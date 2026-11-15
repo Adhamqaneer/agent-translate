@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -41,6 +42,26 @@ if not (
 MESSAGES_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/messages"
 
 
+@dataclass(frozen=True)
+class IncomingMessage:
+    sender: str
+    text: str | None = None
+    media_id: str | None = None
+    media_url: str | None = None
+
+
+def _valid_media_url(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return False
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        return False
+    try:
+        url = httpx.URL(value)
+    except httpx.InvalidURL:
+        return False
+    return url.scheme == "https" and bool(url.host) and not url.userinfo
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -62,7 +83,7 @@ async def verify_webhook(request: Request):
     return PlainTextResponse(challenge)
 
 
-def _incoming_texts(event: object) -> list[tuple[str, str]]:
+def _incoming_messages(event: object) -> list[IncomingMessage]:
     """Validate provider payload shapes before scheduling any outgoing work."""
     def as_object(value):
         if not isinstance(value, dict):
@@ -74,7 +95,7 @@ def _incoming_texts(event: object) -> list[tuple[str, str]]:
             raise ValueError("Expected a webhook list")
         return value
 
-    texts = []
+    incoming = []
     for entry in as_list(as_object(event).get("entry", [])):
         for change in as_list(as_object(entry).get("changes", [])):
             change = as_object(change)
@@ -87,14 +108,24 @@ def _incoming_texts(event: object) -> list[tuple[str, str]]:
             for message in as_list(value.get("messages", [])):
                 message = as_object(message)
                 sender = message.get("from")
-                if message.get("type") != "text" or not isinstance(sender, str) or sender not in ALLOWED_SENDERS:
+                if not isinstance(sender, str) or sender not in ALLOWED_SENDERS:
                     continue
-                text = as_object(message.get("text", {})).get("body", "")
-                if not isinstance(text, str):
-                    raise ValueError("Expected webhook text")
-                if text.strip():
-                    texts.append((sender, text))
-    return texts
+                if message.get("type") == "text":
+                    text = as_object(message.get("text", {})).get("body", "")
+                    if not isinstance(text, str):
+                        raise ValueError("Expected webhook text")
+                    if text.strip():
+                        incoming.append(IncomingMessage(sender, text=text))
+                elif message.get("type") == "audio":
+                    audio = as_object(message.get("audio"))
+                    media_id = audio.get("id")
+                    media_url = audio.get("url")
+                    if not isinstance(media_id, str) or not re.fullmatch(r"[0-9]+", media_id):
+                        raise ValueError("Expected audio media ID")
+                    if media_url is not None and not _valid_media_url(media_url):
+                        raise ValueError("Expected audio media URL")
+                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url))
+    return incoming
 
 
 @app.post("/webhook/whatsapp")
@@ -106,12 +137,15 @@ async def receive_webhook(request: Request, tasks: BackgroundTasks):
         raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
     try:
-        texts = _incoming_texts(json.loads(body))
+        incoming = _incoming_messages(json.loads(body))
     except (ValueError, UnicodeError) as error:
         raise HTTPException(status_code=400, detail="Invalid webhook payload") from error
 
-    for sender, text in texts:
-        tasks.add_task(translate_and_reply, sender, text)
+    for message in incoming:
+        if message.text is not None:
+            tasks.add_task(translate_and_reply, message.sender, message.text)
+        else:
+            tasks.add_task(reply_with_audio_url, message.sender, message.media_id, message.media_url)
     return {"ok": True}
 
 
@@ -127,6 +161,37 @@ async def translate_and_reply(recipient: str, text: str) -> None:
     except (ValueError, RuntimeError) as error:
         logger.error("Translation could not complete (%s)", type(error).__name__)
         reply = "ما قدرت أترجم الرسالة. جرّب نص أقصر وتأكد من إعدادات Gemini."
+
+    await send_text(recipient, reply)
+
+
+async def reply_with_audio_url(
+    recipient: str, media_id: str, media_url: str | None = None,
+) -> None:
+    """Return Meta's temporary URL only; do not download or transcribe audio."""
+    try:
+        if media_url is None:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(
+                    f"https://graph.facebook.com/{VERSION}/{media_id}",
+                    params={"phone_number_id": PHONE_ID},
+                    headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            media_url = payload.get("url") if isinstance(payload, dict) else None
+        if not _valid_media_url(media_url):
+            raise ValueError("Invalid audio media URL")
+        reply = media_url
+    except httpx.HTTPStatusError as error:
+        logger.error("Meta rejected audio URL lookup (HTTP %s)", error.response.status_code)
+        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
+    except httpx.RequestError as error:
+        logger.error("Audio URL lookup connection failed (%s)", type(error).__name__)
+        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
+    except ValueError:
+        logger.error("Audio URL lookup returned an invalid response")
+        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
 
     await send_text(recipient, reply)
 
@@ -157,7 +222,7 @@ async def send_text(recipient: str, text: str) -> None:
                     "messaging_product": "whatsapp",
                     "to": recipient,
                     "type": "text",
-                    "text": {"body": text},
+                    "text": {"body": text, "preview_url": False},
                 },
             )
             response.raise_for_status()

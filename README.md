@@ -9,11 +9,24 @@ meaning, tone, names, numbers, and dates. Formal messages remain formal.
 WhatsApp -> Meta webhook -> FastAPI -> Gemini -> WhatsApp reply
 ```
 
-Only allowlisted senders' text messages are accepted. Each translation is
+Only allowlisted senders' text and audio messages are accepted. Each translation is
 returned to its sender. Questions and commands are translated as text, with no
 answers or extra commentary. Mixed input follows
 its main language; balanced mixed input defaults to English. Use `ar:` or `en:`
 at the start of a message to select the output language explicitly.
+
+For voice notes and other audio messages, the bot replies to the sender with
+Meta's actual temporary media URL as text. It uses `audio.url` from the webhook
+when present; otherwise, it retrieves the URL using `audio.id` and the existing
+WhatsApp access token. Audio is not downloaded, stored, transcribed, or translated.
+The reply contains the URL only, with link previews disabled.
+
+This is an initial media-link test, not a public audio player. Meta's URLs expire
+after five minutes and downloading the audio requires an
+`Authorization: Bearer <WA_ACCESS_TOKEN>` header. Opening the URL in a normal
+browser, or passing it to a tool that cannot supply this header, will not work.
+The bot does not include the access token in the reply. See
+[Meta's media documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/business-phone-numbers/media).
 
 ## Files
 
@@ -105,7 +118,7 @@ Run all tests without calling Gemini or sending WhatsApp messages:
 Tests use placeholder credentials and mocked HTTP transports. They cover retry
 limits and waits, permanent errors, uncertain sends, malformed responses,
 signature verification, sender configuration, per-sender reply routing,
-concurrent requests, batch validation, and `/health`.
+concurrent requests, batch validation, audio URL replies and lookups, and `/health`.
 
 ## Reliability and scope
 
@@ -120,7 +133,9 @@ concurrent requests, batch validation, and `/health`.
 - Retrying a send reuses the translation. Translation failures produce a short
   fallback reply when possible. Logs report status codes and error types rather
   than message text or credentials. API acceptance does not confirm delivery.
-- This version handles allowlisted senders and text messages only. There is no database,
+- Audio URL lookup makes one GET request when the webhook has no media URL.
+  Lookup failures produce a short fallback reply; the audio itself is never fetched.
+- This version handles allowlisted senders and text/audio messages only. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous
   translations when accuracy matters.

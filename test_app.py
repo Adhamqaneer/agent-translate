@@ -16,6 +16,8 @@ import translator
 # Unit tests use placeholders only. No .env or external services are accessed.
 TEST_SENDER = "962700000000"
 SECOND_SENDER = "962700000001"
+MEDIA_ID = "123456789012345"
+MEDIA_URL = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=123&token=private-media-token"
 os.environ.update({
     "WA_PHONE_NUMBER_ID": "123", "WA_ALLOWED_SENDERS": TEST_SENDER,
     "WA_GRAPH_VERSION": "v25.0", "WA_ACCESS_TOKEN": "unit-test-token",
@@ -309,6 +311,10 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.reply_patch = patch("whatsapp.translate_and_reply", self.reply)
         self.reply_patch.start()
         self.addCleanup(self.reply_patch.stop)
+        self.audio_reply = AsyncMock()
+        self.audio_reply_patch = patch("whatsapp.reply_with_audio_url", self.audio_reply)
+        self.audio_reply_patch.start()
+        self.addCleanup(self.audio_reply_patch.stop)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=whatsapp.app), base_url="http://test.invalid",
         )
@@ -330,6 +336,15 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             "/webhook/whatsapp", content=body,
             headers={"X-Hub-Signature-256": signature if signed else "sha256=invalid"},
         )
+
+    def audio_event(self, *, sender=None, phone_id=None, voice=True):
+        event = self.event(sender=sender, phone_id=phone_id, message_type="audio")
+        message = event["entry"][0]["changes"][0]["value"]["messages"][0]
+        message.pop("text")
+        message["audio"] = {
+            "id": MEDIA_ID, "url": MEDIA_URL, "mime_type": "audio/ogg", "voice": voice,
+        }
+        return event
 
     async def test_health_does_not_schedule_translation(self):
         response = await self.client.get("/health")
@@ -356,6 +371,88 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post_event(self.event())
         self.assertEqual(response.status_code, 200)
         self.reply.assert_awaited_once_with(TEST_SENDER, "Hello")
+        self.audio_reply.assert_not_awaited()
+
+    async def test_voice_and_other_audio_route_to_audio_handler(self):
+        for voice in (True, False):
+            with self.subTest(voice=voice):
+                self.audio_reply.reset_mock()
+                response = await self.post_event(self.audio_event(voice=voice))
+                self.assertEqual(response.status_code, 200)
+                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, MEDIA_URL)
+        self.reply.assert_not_awaited()
+
+    async def test_audio_without_webhook_url_can_use_media_lookup(self):
+        for present in (False, True):
+            with self.subTest(null_url=present):
+                self.audio_reply.reset_mock()
+                event = self.audio_event()
+                audio = event["entry"][0]["changes"][0]["value"]["messages"][0]["audio"]
+                if present:
+                    audio["url"] = None
+                else:
+                    audio.pop("url")
+                response = await self.post_event(event)
+                self.assertEqual(response.status_code, 200)
+                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, None)
+        self.reply.assert_not_awaited()
+
+    async def test_audio_retains_signature_allowlist_and_phone_filters(self):
+        cases = [
+            (self.audio_event(), False, 403),
+            (self.audio_event(sender="10000000000"), True, 200),
+            (self.audio_event(phone_id="999"), True, 200),
+        ]
+        for event, signed, expected_status in cases:
+            with self.subTest(signed=signed, event=event):
+                response = await self.post_event(event, signed=signed)
+                self.assertEqual(response.status_code, expected_status)
+        self.reply.assert_not_awaited()
+        self.audio_reply.assert_not_awaited()
+
+    async def test_mixed_batch_routes_text_and_audio_to_their_own_senders(self):
+        event = self.event(text="translate this")
+        messages = event["entry"][0]["changes"][0]["value"]["messages"]
+        messages.append({
+            "from": SECOND_SENDER, "type": "audio",
+            "audio": {"id": MEDIA_ID, "url": MEDIA_URL, "voice": True},
+        })
+        with patch.object(whatsapp, "ALLOWED_SENDERS", frozenset({TEST_SENDER, SECOND_SENDER})):
+            response = await self.post_event(event)
+        self.assertEqual(response.status_code, 200)
+        self.reply.assert_awaited_once_with(TEST_SENDER, "translate this")
+        self.audio_reply.assert_awaited_once_with(SECOND_SENDER, MEDIA_ID, MEDIA_URL)
+
+    async def test_malformed_audio_prevents_all_work_in_mixed_batch(self):
+        invalid_audio = [
+            None, [], {}, {"id": None}, {"id": 123}, {"id": ""},
+            {"id": "../messages"}, {"id": "\u0661\u0662\u0663"},
+            {"id": MEDIA_ID, "url": 123}, {"id": MEDIA_ID, "url": ""},
+            {"id": MEDIA_ID, "url": "http://lookaside.fbsbx.com/audio"},
+            {"id": MEDIA_ID, "url": "https://user:password@example.com/audio"},
+            {"id": MEDIA_ID, "url": "https://example.com/audio file"},
+            {"id": MEDIA_ID, "url": "https://example.com/" + "a" * 4096},
+        ]
+        for audio in invalid_audio:
+            with self.subTest(audio=audio):
+                event = self.event()
+                event["entry"][0]["changes"][0]["value"]["messages"].append({
+                    "from": TEST_SENDER, "type": "audio", "audio": audio,
+                })
+                response = await self.post_event(event)
+                self.assertEqual(response.status_code, 400)
+        self.reply.assert_not_awaited()
+        self.audio_reply.assert_not_awaited()
+
+    async def test_malformed_text_after_audio_does_not_send_audio_reply(self):
+        event = self.audio_event()
+        event["entry"][0]["changes"][0]["value"]["messages"].append({
+            "from": TEST_SENDER, "type": "text", "text": {"body": None},
+        })
+        response = await self.post_event(event)
+        self.assertEqual(response.status_code, 400)
+        self.reply.assert_not_awaited()
+        self.audio_reply.assert_not_awaited()
 
     async def test_two_allowed_senders_in_one_batch_receive_their_own_replies(self):
         event = self.event(sender=TEST_SENDER, text="first message")
@@ -456,6 +553,84 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     with self.assertRaises(RuntimeError):
                         await translator.translate("synthetic input", client, api_key="unit-test-key")
+
+
+class AudioUrlTests(unittest.IsolatedAsyncioTestCase):
+    async def run_audio(self, lookup_response=None, *, direct_url=None):
+        requests = []
+        client_factory = httpx.AsyncClient
+
+        async def handler(request):
+            requests.append(request)
+            # Only the metadata endpoint and outgoing WhatsApp text are allowed.
+            # Fetching the media URL itself or calling Gemini fails this test.
+            self.assertEqual(request.url.host, "graph.facebook.com")
+            self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+            if request.method == "GET":
+                self.assertEqual(request.url.path, f"/{whatsapp.VERSION}/{MEDIA_ID}")
+                self.assertEqual(dict(request.url.params), {"phone_number_id": whatsapp.PHONE_ID})
+                if isinstance(lookup_response, type) and issubclass(lookup_response, httpx.RequestError):
+                    raise lookup_response("private-request-details " + MEDIA_URL, request=request)
+                return lookup_response
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(str(request.url), whatsapp.MESSAGES_URL)
+            payload = json.loads(request.content)
+            self.assertEqual(payload["to"], SECOND_SENDER)
+            self.assertEqual(payload["type"], "text")
+            self.assertIs(payload["text"].get("preview_url", False), False)
+            self.assertNotIn(whatsapp.ACCESS_TOKEN, payload["text"]["body"])
+            return httpx.Response(200, json={"messages": [{"id": "synthetic-audio-url-reply"}]})
+
+        def fake_client(**kwargs):
+            return client_factory(transport=httpx.MockTransport(handler), **kwargs)
+
+        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
+            with patch("whatsapp.translate_message", new_callable=AsyncMock) as translate:
+                await whatsapp.reply_with_audio_url(SECOND_SENDER, MEDIA_ID, direct_url)
+                translate.assert_not_awaited()
+        return requests
+
+    async def test_webhook_media_url_is_replied_without_lookup_or_download(self):
+        requests = await self.run_audio(direct_url=MEDIA_URL)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].method, "POST")
+        self.assertEqual(json.loads(requests[0].content)["text"]["body"], MEDIA_URL)
+
+    async def test_missing_webhook_url_is_resolved_with_authorized_metadata_get(self):
+        requests = await self.run_audio(httpx.Response(200, json={"url": MEDIA_URL}))
+        self.assertEqual([request.method for request in requests], ["GET", "POST"])
+        self.assertEqual(json.loads(requests[1].content)["text"]["body"], MEDIA_URL)
+
+    async def test_failed_or_malformed_lookup_sends_one_private_safe_fallback(self):
+        responses = [
+            httpx.Response(401, json={"error": {
+                "message": "private-provider-details " + whatsapp.ACCESS_TOKEN + " " + MEDIA_URL,
+            }}),
+            httpx.ConnectError,
+            httpx.Response(200, content=b"not JSON"),
+            httpx.Response(200, json=[]),
+            httpx.Response(200, content=b"null"),
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"url": None}),
+            httpx.Response(200, json={"url": 123}),
+            httpx.Response(200, json={"url": "http://example.com/audio"}),
+            httpx.Response(200, json={"url": "https://user:secret@example.com/audio"}),
+            httpx.Response(200, json={"url": "https://example.com/audio\nprivate"}),
+            httpx.Response(200, json={"url": "https://example.com/" + "a" * 4096}),
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
+                    requests = await self.run_audio(response)
+                sends = [request for request in requests if request.method == "POST"]
+                self.assertEqual(len(sends), 1)
+                fallback = json.loads(sends[0].content)["text"]["body"]
+                self.assertTrue(any("\u0600" <= letter <= "\u06ff" for letter in fallback))
+                self.assertNotIn("https://", fallback)
+                output = "\n".join(recorded.output)
+                for private in (MEDIA_URL, MEDIA_ID, whatsapp.ACCESS_TOKEN, SECOND_SENDER,
+                                "private-request-details", "private-provider-details"):
+                    self.assertNotIn(private, output)
 
 
 if __name__ == "__main__":
