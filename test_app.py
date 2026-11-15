@@ -21,6 +21,8 @@ TEST_SENDER = "962700000000"
 SECOND_SENDER = "962700000001"
 MEDIA_ID = "123456789012345"
 MEDIA_URL = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=123&token=private-media-token"
+OUTPUT_MEDIA_ID = "987654321012345"
+SYNTHESIZED_AUDIO = b"OggS" + b"\x00" * 24 + b"OpusHead-private-synthesized-audio"
 os.environ.update({
     "WA_PHONE_NUMBER_ID": "123", "WA_ALLOWED_SENDERS": TEST_SENDER,
     "WA_GRAPH_VERSION": "v25.0", "WA_ACCESS_TOKEN": "unit-test-token",
@@ -559,7 +561,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_signed_audio_webhook_downloads_transcribes_translates_and_replies(self):
+    async def test_signed_audio_webhook_replies_with_translated_voice_and_reuses_it_on_retry(self):
         audio = b"OggS-private-synthetic-voice"
         encoded_audio = base64.b64encode(audio).decode()
         transcript = "private transcript: please send the address when you have time"
@@ -601,15 +603,29 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(payload["contents"], [{"role": "user", "parts": [{"text": transcript}]}])
                 self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], translator.INSTRUCTIONS)
                 return gemini_result(translation)
+            if request.url.path == f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/media":
+                steps.append("upload")
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(request.url.host, "graph.facebook.com")
+                self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+                self.assertTrue(request.headers["content-type"].startswith("multipart/form-data;"))
+                multipart = request.content
+                self.assertIn(b'filename="voice.ogg"', multipart)
+                self.assertIn(b"Content-Type: audio/ogg", multipart)
+                self.assertIn(b'name="messaging_product"\r\n\r\nwhatsapp', multipart)
+                self.assertIn(b'name="type"\r\n\r\naudio/ogg', multipart)
+                self.assertIn(SYNTHESIZED_AUDIO, multipart)
+                return httpx.Response(200, json={"id": OUTPUT_MEDIA_ID})
             self.assertEqual(str(request.url), whatsapp.MESSAGES_URL)
             self.assertEqual(request.method, "POST")
             steps.append("reply")
             self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
             payload = json.loads(request.content)
             self.assertEqual(payload["to"], SECOND_SENDER)
-            self.assertEqual(payload["type"], "text")
-            self.assertEqual(payload["text"]["body"], translation)
-            self.assertIs(payload["text"].get("preview_url", False), False)
+            self.assertEqual(payload["messaging_product"], "whatsapp")
+            self.assertEqual(payload["type"], "audio")
+            self.assertEqual(payload["audio"], {"id": OUTPUT_MEDIA_ID, "voice": True})
+            self.assertNotIn("text", payload)
             if steps.count("reply") == 1:
                 return httpx.Response(429, json={})
             return httpx.Response(200, json={"messages": [{"id": "synthetic-translated-voice"}]})
@@ -631,12 +647,14 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
         async with client_factory(transport=httpx.ASGITransport(app=whatsapp.app), base_url="http://test.invalid") as client:
             with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client), patch("retry_http.asyncio.sleep", new_callable=AsyncMock):
                 with patch.object(whatsapp, "ALLOWED_SENDERS", frozenset({TEST_SENDER, SECOND_SENDER})):
-                    with self.assertLogs(whatsapp.logger, level="INFO") as recorded:
-                        response = await client.post(
-                            "/webhook/whatsapp", content=body, headers={"X-Hub-Signature-256": signature},
-                        )
+                    with patch("whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
+                        with self.assertLogs(whatsapp.logger, level="INFO") as recorded:
+                            response = await client.post(
+                                "/webhook/whatsapp", content=body, headers={"X-Hub-Signature-256": signature},
+                            )
+        synthesize.assert_awaited_once_with(translation)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(steps, ["metadata", "audio", "stt", "translation", "reply", "reply"])
+        self.assertEqual(steps, ["metadata", "audio", "stt", "translation", "upload", "reply", "reply"])
         output = "\n".join(recorded.output)
         for private in (transcript, encoded_audio, audio.decode(), os.environ["GEMINI_API_KEY"],
                         whatsapp.ACCESS_TOKEN, MEDIA_URL):
@@ -664,8 +682,12 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
                 {"download": download, "stt": stt, "translation": translate}[stage].side_effect = error
                 with patch("whatsapp.download_audio", download), patch("whatsapp.transcribe_audio", stt):
                     with patch("whatsapp.translate_message", translate), patch("whatsapp.send_text", new_callable=AsyncMock) as send:
-                        with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
-                            await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
+                        with patch("whatsapp.synthesize_speech", new_callable=AsyncMock) as synthesize:
+                            with patch("whatsapp.send_voice", new_callable=AsyncMock) as voice:
+                                with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
+                                    await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
+                synthesize.assert_not_awaited()
+                voice.assert_not_awaited()
                 download.assert_awaited_once_with(MEDIA_ID)
                 if stage == "download":
                     stt.assert_not_awaited()
@@ -683,6 +705,146 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
                 for private in (transcript, audio.decode(), base64.b64encode(audio).decode(),
                                 os.environ["GEMINI_API_KEY"], whatsapp.ACCESS_TOKEN, MEDIA_URL):
                     self.assertNotIn(private, output)
+
+    async def test_voice_output_failures_reuse_translation_and_uncertain_sends_do_not_send_text(self):
+        transcript = "private-output-transcript"
+        translation = "هاي الترجمة الجاهزة."
+        private_details = transcript + " " + os.environ["GEMINI_API_KEY"]
+        cases = [
+            (RuntimeError(private_details), None, True),
+            (ValueError(private_details), None, True),
+            (None, "failed", True),
+            (None, "uncertain", False),
+            (None, "accepted", False),
+        ]
+        for tts_error, delivery, expect_text in cases:
+            with self.subTest(tts_error=type(tts_error).__name__, delivery=delivery):
+                with patch("whatsapp.download_audio", new_callable=AsyncMock, return_value=(b"OggS-input", "audio/ogg")) as download:
+                    with patch("whatsapp.transcribe_audio", new_callable=AsyncMock, return_value=transcript) as stt:
+                        with patch("whatsapp.translate_message", new_callable=AsyncMock, return_value=translation) as translate:
+                            with patch("whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
+                                synthesize.side_effect = tts_error
+                                with patch("whatsapp.send_voice", new_callable=AsyncMock, return_value=delivery) as voice:
+                                    with patch("whatsapp.send_text", new_callable=AsyncMock) as send:
+                                        with patch.object(whatsapp.logger, "error") as error_log, patch.object(whatsapp.logger, "warning") as warning_log:
+                                            await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
+                download.assert_awaited_once_with(MEDIA_ID)
+                stt.assert_awaited_once_with(b"OggS-input", "audio/ogg")
+                translate.assert_awaited_once_with(transcript)
+                synthesize.assert_awaited_once_with(translation)
+                if tts_error:
+                    voice.assert_not_awaited()
+                else:
+                    voice.assert_awaited_once_with(SECOND_SENDER, SYNTHESIZED_AUDIO)
+                if expect_text:
+                    send.assert_awaited_once_with(SECOND_SENDER, translation)
+                else:
+                    send.assert_not_awaited()
+                output = str(error_log.call_args_list) + str(warning_log.call_args_list)
+                for private in (transcript, os.environ["GEMINI_API_KEY"], whatsapp.ACCESS_TOKEN):
+                    self.assertNotIn(private, output)
+
+
+class VoiceDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def deliver(self, *, upload_responses=None, send_responses=None):
+        uploads = list(upload_responses or [httpx.Response(200, json={"id": OUTPUT_MEDIA_ID})])
+        sends = list(send_responses or [httpx.Response(200, json={"messages": [{"id": "synthetic-voice-message"}]})])
+        requests = []
+        client_factory = httpx.AsyncClient
+
+        async def handler(request):
+            requests.append(request)
+            self.assertEqual(request.url.host, "graph.facebook.com")
+            self.assertEqual(request.method, "POST")
+            self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+            if request.url.path == f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/media":
+                self.assertIn(SYNTHESIZED_AUDIO, request.content)
+                self.assertIn(b'filename="voice.ogg"', request.content)
+                response = uploads.pop(0)
+            else:
+                self.assertEqual(str(request.url), whatsapp.MESSAGES_URL)
+                payload = json.loads(request.content)
+                self.assertEqual(payload, {
+                    "messaging_product": "whatsapp", "to": SECOND_SENDER,
+                    "type": "audio", "audio": {"id": OUTPUT_MEDIA_ID, "voice": True},
+                })
+                response = sends.pop(0)
+            if isinstance(response, type) and issubclass(response, httpx.RequestError):
+                raise response("private-delivery-details " + whatsapp.ACCESS_TOKEN, request=request)
+            return response
+
+        def fake_client(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return client_factory(**kwargs)
+
+        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
+            with patch("retry_http.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                with patch("retry_http.random.uniform", return_value=0.0):
+                    with patch.object(whatsapp.logger, "error") as error_log, patch.object(whatsapp.logger, "warning") as warning_log:
+                        result = await whatsapp.send_voice(SECOND_SENDER, SYNTHESIZED_AUDIO)
+        output = str(error_log.call_args_list) + str(warning_log.call_args_list)
+        for private in (whatsapp.ACCESS_TOKEN, SECOND_SENDER, "private-delivery-details", "private-provider-message"):
+            self.assertNotIn(private, output)
+        return result, requests, sleep
+
+    async def test_upload_and_send_retry_independently_reusing_voice_bytes_and_media_id(self):
+        result, requests, sleep = await self.deliver(
+            upload_responses=[httpx.Response(429, json={}), httpx.Response(200, json={"id": OUTPUT_MEDIA_ID})],
+            send_responses=[httpx.Response(429, json={}), httpx.Response(200, json={"messages": [{"id": "synthetic-voice-message"}]})],
+        )
+        self.assertEqual(result, "accepted")
+        self.assertEqual([request.url.path for request in requests], [
+            f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/media",
+            f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/media",
+            f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/messages",
+            f"/{whatsapp.VERSION}/{whatsapp.PHONE_ID}/messages",
+        ])
+        self.assertEqual(sleep.await_count, 2)
+
+    async def test_upload_failures_are_definite_failures_before_any_message_send(self):
+        failures = [
+            httpx.Response(401, json={"error": {"code": 190, "message": "private-provider-message"}}),
+            httpx.ReadTimeout,
+            httpx.Response(200, content=b"not JSON"),
+            httpx.Response(200, json={}),
+            httpx.Response(200, json={"id": 123}),
+        ]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                result, requests, _ = await self.deliver(upload_responses=[failure])
+                self.assertEqual(result, "failed")
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(requests[0].url.path.endswith("/media"))
+
+    async def test_uncertain_message_results_are_not_retried(self):
+        failures = [
+            httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError,
+            httpx.CloseError, httpx.RemoteProtocolError,
+            httpx.Response(500, json={}), httpx.Response(502, text="gateway outcome unknown"),
+            httpx.Response(500, json={"error": {"code": 131000, "message": "private-provider-message"}}),
+            httpx.Response(500, json={"error": {"code": ["private-provider-message"]}}),
+            httpx.Response(408, json={}), httpx.Response(200, content=b"not JSON"),
+            httpx.Response(200, json={}), httpx.Response(200, json={"messages": []}),
+            httpx.Response(200, json={"messages": [{"id": 123}]}),
+        ]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                result, requests, sleep = await self.deliver(send_responses=[failure])
+                self.assertEqual(result, "uncertain")
+                self.assertEqual(len(requests), 2)
+                sleep.assert_not_awaited()
+
+    async def test_explicit_message_rejection_is_failed_for_text_fallback(self):
+        failures = [
+            httpx.Response(400, json={"error": {"code": 100, "message": "private-provider-message"}}),
+            httpx.Response(403, json={"error": {"code": 10}}),
+            httpx.Response(503, json={"error": {"code": 190, "message": "private-provider-message"}}),
+        ]
+        for failure in failures:
+            with self.subTest(status=failure.status_code):
+                result, requests, _ = await self.deliver(send_responses=[failure])
+                self.assertEqual(result, "failed")
+                self.assertEqual(len(requests), 2)
 
 
 class AudioUrlTests(unittest.IsolatedAsyncioTestCase):

@@ -11,8 +11,9 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 
-from retry_http import post_with_retry, response_error
+from retry_http import SAFE_CONNECTION_ERRORS, post_with_retry, response_error
 from stt import transcribe_audio
+from tts import synthesize_speech
 from translator import translate_message
 
 
@@ -42,6 +43,7 @@ if not (
     raise RuntimeError("Check the WhatsApp settings in .env before starting the server.")
 
 MESSAGES_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/messages"
+MEDIA_UPLOAD_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/media"
 AUDIO_LINK_TTL = 15 * 60
 MAX_AUDIO_BYTES = 16 * 1024 * 1024
 MEDIA_DOWNLOAD_HOSTS = frozenset({"lookaside.fbsbx.com", "lookaside.facebook.com"})
@@ -286,6 +288,15 @@ async def transcribe_and_reply(recipient: str, media_id: str) -> None:
     except (ValueError, RuntimeError) as error:
         logger.error("Voice %s could not complete (%s)", stage, type(error).__name__)
         reply = "ما قدرت أفرّغ الفويس أو أترجمه. جرّب تسجيل أوضح وأقصر."
+    else:
+        try:
+            voice = await synthesize_speech(reply)
+        except (httpx.HTTPError, ValueError, RuntimeError) as error:
+            logger.error("Voice synthesis could not complete (%s); sending text", type(error).__name__)
+        else:
+            outcome = await send_voice(recipient, voice)
+            if outcome != "failed":
+                return
 
     await send_text(recipient, reply)
 
@@ -341,3 +352,73 @@ async def send_text(recipient: str, text: str) -> None:
                      _error_summary(details, recipient, text))
     except httpx.RequestError as error:
         logger.error("WhatsApp reply was not confirmed (%s)", type(error).__name__)
+
+
+async def send_voice(recipient: str, audio: bytes) -> str:
+    """Upload once, then send a voice note without repeating ambiguous sends."""
+    if (not isinstance(audio, bytes) or len(audio) > MAX_AUDIO_BYTES
+            or not audio.startswith(b"OggS") or b"OpusHead" not in audio[:256]):
+        logger.error("Outgoing voice note has an invalid format or size")
+        return "failed"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+        try:
+            upload = await post_with_retry(
+                client, MEDIA_UPLOAD_URL, service="whatsapp", headers=headers,
+                data={"messaging_product": "whatsapp", "type": "audio/ogg"},
+                files={"file": ("voice.ogg", audio, "audio/ogg")},
+            )
+            upload.raise_for_status()
+            payload = upload.json()
+            media_id = payload.get("id") if isinstance(payload, dict) else None
+            if not isinstance(media_id, str) or not re.fullmatch(r"[0-9]+", media_id):
+                raise ValueError("Invalid uploaded media ID")
+        except httpx.HTTPStatusError as error:
+            details = response_error(error.response)
+            code = details.get("code")
+            code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            logger.error("Meta rejected voice upload (HTTP %s, code %s)",
+                         error.response.status_code, code)
+            return "failed"
+        except httpx.RequestError as error:
+            logger.error("Voice upload failed (%s)", type(error).__name__)
+            return "failed"
+        except ValueError:
+            logger.error("Meta returned an invalid voice upload response")
+            return "failed"
+
+        try:
+            response = await post_with_retry(
+                client, MESSAGES_URL, service="whatsapp", headers=headers,
+                json={"messaging_product": "whatsapp", "to": recipient,
+                      "type": "audio", "audio": {"id": media_id, "voice": True}},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            details = response_error(error.response)
+            status = error.response.status_code
+            code = details.get("code")
+            code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            logger.error("Meta did not accept voice reply (HTTP %s, code %s)", status, code)
+            if (400 <= status < 500 and status != 408
+                    or code in {100, 190, 130429, 131016, 131026, 131030, 131056}
+                    or details.get("is_transient") is True):
+                return "failed"
+            return "uncertain"
+        except SAFE_CONNECTION_ERRORS as error:
+            logger.error("Voice reply connection failed (%s)", type(error).__name__)
+            return "failed"
+        except httpx.RequestError as error:
+            logger.error("Voice reply was not confirmed (%s)", type(error).__name__)
+            return "uncertain"
+        try:
+            payload = response.json()
+            messages = payload.get("messages") if isinstance(payload, dict) else None
+            if (not isinstance(messages, list) or not messages or not isinstance(messages[0], dict)
+                    or not isinstance(messages[0].get("id"), str) or not messages[0]["id"].strip()):
+                raise ValueError("Unconfirmed voice reply")
+        except ValueError:
+            logger.error("Meta returned an unconfirmed voice reply response")
+            return "uncertain"
+    logger.info("WhatsApp accepted the outgoing voice reply")
+    return "accepted"

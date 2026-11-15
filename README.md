@@ -7,7 +7,7 @@ meaning, tone, names, numbers, and dates. Formal messages remain formal.
 
 ```text
 WhatsApp -> Meta webhook -> FastAPI -> Gemini -> WhatsApp reply
-Voice note -> Meta audio download -> Gemini STT -> Gemini translation -> WhatsApp text
+Voice note -> Meta audio download -> Gemini STT -> translation -> Gemini TTS -> WhatsApp voice
 ```
 
 Only allowlisted senders' text and audio messages are accepted. Each translation is
@@ -18,12 +18,29 @@ at the start of a message to select the output language explicitly.
 
 For voice notes and other supported audio messages, the bot downloads the audio
 from Meta, transcribes it in its original language, and passes the transcript to
-the existing Arabic-English translator. The sender receives the translation
-as a normal WhatsApp text message. The transcript is internal; spoken questions
+the existing Arabic-English translator. Gemini TTS then reads the translated
+text, and the sender receives an OGG/Opus WhatsApp voice note. Text messages
+still receive text translations. The transcript is internal; spoken questions
 and commands are translated, not answered or executed. Text messages keep their
 existing translation behavior. No separate agent framework or STT provider is
-required: both transcription and translation use the existing Gemini API key.
+required: transcription, translation, and speech generation use the existing
+Gemini API key, with a separate audio-generation model for TTS.
 See [Gemini's transcription support](https://aistudio.google.com/docs/models/gemini-3.1-flash-lite).
+
+TTS defaults to `gemini-3.8-flash-tts` with the prebuilt voice `Puck`. It speaks
+the translated text verbatim using Gemini's Interactions API with `store: false`.
+The generated WAV is converted in memory to mono OGG/Opus and uploaded to Meta
+as `audio/ogg`; the outgoing audio message sets `voice: true`. The pinned
+`imageio-ffmpeg` dependency supplies the encoder on supported Windows/Linux
+platforms, including Render's Linux runtime. No separate system ffmpeg install
+is needed when the platform wheel is available. See
+[Gemini TTS](https://aistudio.google.com/docs/speech-generation) and
+[Meta's voice message format](https://www.postman.com/meta/whatsapp-business-platform/request/c8mw7ar/send-reply-to-audio-message-by-id).
+
+If synthesis, encoding, or upload fails, the bot sends the already completed
+translation as text. An uncertain voice send is not repeated or followed by a
+text fallback, because the voice may already have been delivered. Invalid TTS
+settings or a model unavailable to the API key also use the text fallback.
 
 Audio downloads use `audio.id` to retrieve a fresh media URL and authenticate
 with `WA_ACCESS_TOKEN`, which stays on the server. Downloads are limited to
@@ -44,7 +61,7 @@ fails. If deletion fails, it logs a generic cleanup warning; remote retention
 then follows [Gemini's Files API policy](https://aistudio.google.com/docs/files).
 
 The previous signed playback endpoint and link helper remain available for
-debugging, but voice replies now contain the translation instead of a link.
+debugging, but normal voice replies now contain translated audio instead of a link.
 Playback links expire after 15 minutes; anyone holding a link can access that
 one audio file until it expires. Changing `META_APP_SECRET` invalidates old links.
 Playback responses disable caching. On Render, the link helper uses the
@@ -61,9 +78,11 @@ not needed for voice transcription. Links never use the incoming Host header. Se
 | `whatsapp.py` | Webhook routes, signature validation, sender filtering, and replies. |
 | `translator.py` | Prompt, Gemini translation, shared configuration, and CLI. |
 | `stt.py` | Gemini speech-to-text, audio input handling, and transcription validation. |
+| `tts.py` | Gemini text-to-speech and in-memory OGG/Opus encoding. |
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
 | `test_app.py` | Offline retry, pipeline, and webhook tests. |
 | `test_stt.py` | Offline transcription API and response-validation tests. |
+| `test_tts.py` | Offline speech generation, encoder lifecycle, and real encoding smoke tests. |
 | `requirements.txt` | Pinned direct dependencies. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
 
@@ -96,6 +115,8 @@ when running the virtual environment's Python executable directly.
 | `GEMINI_API_KEY` | Gemini API key. |
 | `GEMINI_MODEL` | Optional; defaults to `gemini-3.1-flash-lite`. |
 | `GEMINI_STT_MODEL` | Optional transcription model; defaults to `GEMINI_MODEL` or `gemini-3.1-flash-lite`. Must support audio input. Uses the same `GEMINI_API_KEY`. |
+| `GEMINI_TTS_MODEL` | Optional speech-generation model; defaults to `gemini-3.8-flash-tts`. Must support the Interactions TTS format. |
+| `GEMINI_TTS_VOICE` | Optional prebuilt Gemini voice; defaults to `Puck`. Other supported voices include `Kore`, `Zephyr`, and `Charon`. |
 | `PUBLIC_BASE_URL` | Optional; public HTTPS origin for playback links only. Overrides `RENDER_EXTERNAL_URL`. Not required for voice translation. |
 
 To allow multiple people, set this in your local `.env` or the host's environment
@@ -149,9 +170,13 @@ Tests use placeholder credentials and mocked HTTP transports. They cover retry
 limits and waits, permanent errors, uncertain sends, malformed responses,
 signature verification, sender configuration, per-sender reply routing,
 concurrent requests, batch validation, audio URL replies and lookups, and `/health`.
-Audio tests also cover the download/transcription/translation/reply pipeline,
+Audio tests also cover the download/transcription/translation/synthesis/voice-reply pipeline,
 signed-link expiry and tampering, token authentication on media downloads,
 untrusted download hosts, and download size/type limits.
+Speech-generation requests are mocked; an encoder smoke test uses the bundled
+ffmpeg to verify real mono OGG/Opus output. Voice delivery tests cover multipart
+uploads, `voice: true`, upload/send retries, and text fallback after definite
+failures while avoiding duplicate replies after uncertain sends.
 
 ## Reliability and scope
 
@@ -170,10 +195,11 @@ untrusted download hosts, and download size/type limits.
   one metadata lookup and one audio download, with no automatic retries.
   Expired/invalid links do not make upstream requests. Upstream download failures
   return a generic error; expired links require resending the voice note.
-- Voice translation normally makes two Gemini calls: transcription, then
-  translation. Failures send one short fallback reply when possible; a failed
-  download or transcription does not proceed to translation. Sending retries
-  reuse the completed translation rather than processing the audio again.
+- Voice translation normally makes three Gemini calls: transcription,
+  translation, then speech generation. A failed download or transcription does
+  not proceed to later stages. TTS/encoding/upload failures reuse the translation
+  as a text fallback. Temporary voice-send rejections reuse the uploaded media ID;
+  retries do not repeat transcription, translation, synthesis, or upload.
 - This version handles allowlisted senders and text/audio messages only. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous
