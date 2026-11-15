@@ -23,14 +23,42 @@ it using the same style and accuracy instructions as chat messages. Images and
 scanned PDFs use Gemini's visual text reading; Office documents use Gemini's
 document input support. See [Gemini document processing](https://aistudio.google.com/docs/document-processing).
 
-Supported attachments are JPEG, PNG, WebP, PDF, Word (`.doc`/`.docx`), PowerPoint
-(`.ppt`/`.pptx`), and UTF-8 plain text (`.txt`, including a UTF-8 BOM). Images are limited to 5 MiB, and other
-documents to 20 MiB. Unsupported types, empty/unreadable files, and incomplete
-extraction receive a short explanatory reply. Captions, filenames, forwarding
-metadata, and advertising fields are not part of the source text or instructions.
+Supported formats are selected by their actual MIME type:
+
+| Category | Formats |
+| --- | --- |
+| Images | JPEG, PNG, WebP, HEIC, HEIF, GIF, AVIF, BMP. |
+| Documents | PDF, DOC, DOCX, DOTX, ODT, RTF. |
+| Presentations | PPT, PPTX, ODP. |
+| Spreadsheets | XLS, XLSX, XLSM, XLSB, ODS; every worksheet is read. |
+| Text and data | TXT, CSV, TSV, Markdown, JSON, YAML, HTML, XML, CSS, SVG, logs and configuration text. |
+| Source code | Common Python, JavaScript, TypeScript, Java, C/C++, C#, Go, Rust, shell, SQL, LaTeX, and notebook text formats. |
+
+Other well-formed `text/*` MIME types are accepted as text. Text must be UTF-8
+(with or without a BOM) or BOM-marked UTF-16; the reader does not guess legacy
+encodings. RTF is converted to visible text with its declared codepage and Unicode
+escapes. Images are limited to 5 MiB, and other documents to 20 MiB. Unsupported
+types, empty/unreadable files, and incomplete extraction receive an explanatory
+reply. Archives and executable files are not treated as readable documents.
+Captions, forwarding metadata, and advertising fields are not source text or
+instructions. Filenames are used only as type hints when Meta reports a generic
+binary/ZIP MIME type; known suffixes are resolved without opening a local path,
+executing content, or overriding an explicit unsupported type. See
+`attachment_types.py` for the complete MIME/extension catalog.
 An image's caption is not used as a substitute for reading text inside the image.
 PowerPoint text is read in slide order and returned as text translations; no
 translated presentation file is generated.
+
+Spreadsheets use the pinned Calamine reader rather than Gemini's native workbook
+input, which reads only the first sheet. All worksheets (including hidden ones)
+are represented in workbook order, with sheet names, row labels, column positions,
+and cached cell values. Dates and numbers are preserved as text; formulas are not
+recalculated and macros/external links are not run. Charts and embedded pictures
+are not extracted by the cell-value reader. Workbooks have additional limits of
+100 sheets, 100,000 cells/rows, and 100,000 extracted characters. ZIP/XML preflight
+checks reject oversized or encrypted content. Parsing runs in a disposable worker
+with a 30-second timeout; Linux workers also limit memory to 256 MiB and CPU to
+15 seconds. No workbook data is written to disk or included in command arguments.
 
 One output language is selected from the main language of the entire attachment;
 Arabic content translates to English and English to Arabic. The contents are
@@ -113,12 +141,17 @@ not needed for voice transcription. Links never use the incoming Host header. Se
 | `stt.py` | Gemini speech-to-text, audio input handling, and transcription validation. |
 | `tts.py` | Gemini text-to-speech and in-memory OGG/Opus encoding. |
 | `attachments.py` | Image/document text extraction, complete translation, and ordered text replies. |
+| `attachment_types.py` | Canonical MIME types, format aliases, and restricted filename hints. |
+| `spreadsheet_text.py` | All-worksheet extraction in an isolated, bounded worker. |
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
 | `test_app.py` | Offline retry, pipeline, and webhook tests. |
 | `test_stt.py` | Offline transcription API and response-validation tests. |
 | `test_tts.py` | Offline speech generation, encoder lifecycle, and real encoding smoke tests. |
 | `test_attachments.py` | Offline extraction, file formats, chunking, and translation tests. |
 | `test_attachments_app.py` | Attachment webhook routing, authenticated downloads, and text delivery tests. |
+| `test_attachment_types.py` | MIME/extension resolution and unsupported-type guards. |
+| `test_expanded_formats.py` | Text encodings, real RTF conversion, and local-reader integration. |
+| `test_spreadsheet_text.py` | Real in-memory XLSX/ODS files, worksheet completeness, and worker limits. |
 | `requirements.txt` | Pinned direct dependencies. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
 

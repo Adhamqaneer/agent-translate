@@ -1,5 +1,6 @@
 """Extract complete attachment text and prepare ordered WhatsApp translations."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -9,16 +10,14 @@ import re
 import httpx
 
 from retry_http import post_with_retry
+from attachment_types import (
+    IMAGE_MIME_TYPES, RTF_MIME_TYPES, SPREADSHEET_MIME_TYPES,
+    SUPPORTED_MIME_TYPES, is_text_type, resolve_mime_type,
+)
+from spreadsheet_text import extract_spreadsheet
 from translator import DEFAULT_MODEL, INSTRUCTIONS, TARGET_LANGUAGES
 
 
-IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
-SUPPORTED_MIME_TYPES = IMAGE_MIME_TYPES | frozenset({
-    "application/pdf", "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain",
-    "application/vnd.ms-powerpoint",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-})
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 100000
@@ -63,6 +62,47 @@ EXTRACTION_SCHEMA = {
 
 class AttachmentError(ValueError):
     """An attachment could not be processed completely within the supported limits."""
+
+
+def _decode_text(data: bytes) -> str:
+    try:
+        encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        text = data.decode(encoding)
+    except UnicodeError:
+        raise AttachmentError("Text attachments must use UTF-8 or BOM-marked UTF-16 encoding.") from None
+    return _validate_local_text(text)
+
+
+def _validate_local_text(text: str) -> str:
+    if (not text.strip() or len(text) > MAX_EXTRACTED_CHARS
+            or any((ord(character) < 32 and character not in "\t\n\r\f")
+                   or ord(character) == 127 for character in text)):
+        raise AttachmentError("Attachment text is empty, binary, or too long.")
+    return text
+
+
+def _read_rtf(data: bytes) -> str:
+    if not data.lstrip().startswith(b"{\\rtf") or b"\x00" in data:
+        raise AttachmentError("Invalid RTF attachment.")
+    try:
+        from striprtf.striprtf import rtf_to_text
+        codepage = re.search(rb"\\ansicpg([0-9]{1,5})\b", data[:4096])
+        encoding = "cp" + codepage[1].decode("ascii") if codepage else "cp1252"
+        source = data.decode(encoding, errors="strict")
+        depth = 0
+        for token in re.finditer(r"\\.|[{}]", source):
+            if token[0] == "{":
+                depth += 1
+            elif token[0] == "}":
+                depth -= 1
+            if depth < 0 or depth > 1000:
+                raise ValueError("Invalid RTF groups")
+        if depth:
+            raise ValueError("Incomplete RTF groups")
+        text = rtf_to_text(source, encoding=encoding, errors="strict")
+    except Exception:
+        raise AttachmentError("Could not read the complete RTF attachment.") from None
+    return _validate_local_text(text)
 
 
 def _split_text(text: str, limit: int) -> list[str]:
@@ -149,10 +189,8 @@ def _parse_translation(response: httpx.Response) -> str:
 
 
 async def translate_attachment(data: bytes, mime_type: str) -> list[str]:
-    if not isinstance(mime_type, str):
-        raise AttachmentError("Unsupported attachment type.")
-    mime_type = mime_type.split(";", 1)[0].strip().lower()
-    if mime_type not in SUPPORTED_MIME_TYPES:
+    mime_type = resolve_mime_type(mime_type)
+    if mime_type is None:
         raise AttachmentError("Unsupported attachment type.")
     if not isinstance(data, bytes) or not data:
         raise AttachmentError("The attachment is empty or invalid.")
@@ -161,15 +199,13 @@ async def translate_attachment(data: bytes, mime_type: str) -> list[str]:
         raise AttachmentError("The attachment exceeds the supported size limit.")
 
     original_text = None
-    if mime_type == "text/plain":
-        try:
-            original_text = data.decode("utf-8-sig")
-        except UnicodeError:
-            raise AttachmentError("Text attachments must use UTF-8 encoding.") from None
-        if (not original_text.strip() or len(original_text) > MAX_EXTRACTED_CHARS
-                or any((ord(character) < 32 and character not in "\t\n\r\f")
-                       or ord(character) == 127 for character in original_text)):
-            raise AttachmentError("Text attachment content is empty, binary, or too long.")
+    if mime_type in SPREADSHEET_MIME_TYPES:
+        original_text = _validate_local_text(await asyncio.to_thread(extract_spreadsheet, data))
+    elif mime_type in RTF_MIME_TYPES:
+        original_text = await asyncio.to_thread(_read_rtf, data)
+    elif is_text_type(mime_type):
+        original_text = _decode_text(data)
+    if original_text is not None:
         content = {"type": "text", "text": original_text}
     else:
         content = {

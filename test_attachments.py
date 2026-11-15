@@ -45,10 +45,11 @@ class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
             return await attachments.translate_attachment(data, mime_type)
 
     async def test_supported_native_images_documents_and_text_use_expected_blocks(self):
-        for mime_type in sorted(attachments.SUPPORTED_MIME_TYPES):
+        native_and_text = attachments.SUPPORTED_MIME_TYPES - attachments.SPREADSHEET_MIME_TYPES - attachments.RTF_MIME_TYPES
+        for mime_type in sorted(native_and_text):
             with self.subTest(mime_type=mime_type):
                 requests = []
-                data = SOURCE.encode() if mime_type == "text/plain" else b"synthetic-file"
+                data = SOURCE.encode() if attachments.is_text_type(mime_type) else b"synthetic-file"
 
                 async def handler(request):
                     requests.append(request)
@@ -62,7 +63,7 @@ class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
                         })
                         self.assertEqual(payload["system_instruction"], attachments.EXTRACTION_INSTRUCTIONS)
                         block = payload["input"][0]
-                        if mime_type == "text/plain":
+                        if attachments.is_text_type(mime_type):
                             self.assertEqual(block, {"type": "text", "text": SOURCE})
                         else:
                             kind = "image" if mime_type in attachments.IMAGE_MIME_TYPES else "document"

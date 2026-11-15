@@ -3,3 +3,5 @@ httpx==0.28.1
 uvicorn[standard]==0.54.0
 python-dotenv==1.2.4
 imageio-ffmpeg==0.8.1
+python-calamine==0.8.0
+striprtf==0.0.35

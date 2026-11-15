@@ -15,6 +15,7 @@ from attachments import (
     IMAGE_MIME_TYPES, MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES,
     SUPPORTED_MIME_TYPES, translate_attachment,
 )
+from attachment_types import is_text_type, resolve_mime_type
 from retry_http import SAFE_CONNECTION_ERRORS, post_with_retry, response_error
 from stt import transcribe_audio
 from tts import synthesize_speech
@@ -64,6 +65,7 @@ class IncomingMessage:
     media_id: str | None = None
     media_url: str | None = None
     media_kind: str = "audio"
+    filename: str | None = None
 
 
 def _valid_media_url(value: object) -> bool:
@@ -100,6 +102,7 @@ def build_audio_link(media_id: str) -> str:
 
 async def _download_media(
     media_id: str, *, allowed_types: frozenset[str], max_bytes: int, kind: str,
+    filename: str | None = None,
 ) -> tuple[bytes, str]:
     """Fetch bounded media from trusted Meta metadata, never a webhook URL."""
     if not re.fullmatch(r"[0-9]+", media_id):
@@ -119,11 +122,14 @@ async def _download_media(
             mime_type = payload.get("mime_type")
             if not _valid_media_url(media_url) or not isinstance(mime_type, str):
                 raise ValueError("Invalid media metadata")
-            mime_type = mime_type.split(";", 1)[0].strip().lower()
-            if mime_type not in allowed_types:
-                if kind == "audio":
+            if kind == "attachment":
+                mime_type = resolve_mime_type(mime_type, filename)
+                if mime_type is None or (allowed_types == IMAGE_MIME_TYPES and mime_type not in IMAGE_MIME_TYPES):
+                    raise HTTPException(status_code=415, detail="Unsupported media type")
+            else:
+                mime_type = mime_type.split(";", 1)[0].strip().lower()
+                if mime_type not in allowed_types:
                     raise ValueError("Unsupported audio type")
-                raise HTTPException(status_code=415, detail="Unsupported media type")
             limit = min(max_bytes, MAX_IMAGE_BYTES) if mime_type in IMAGE_MIME_TYPES else max_bytes
             file_size = payload.get("file_size")
             if file_size is not None and int(file_size) > limit:
@@ -134,7 +140,15 @@ async def _download_media(
             async with client.stream("GET", media_url, headers=headers) as media:
                 media.raise_for_status()
                 content_type = media.headers.get("content-type", mime_type).split(";", 1)[0].strip().lower()
-                if content_type not in {mime_type, "application/octet-stream"}:
+                matching_type = resolve_mime_type(content_type, filename) if kind == "attachment" else content_type
+                generic_types = {"application/octet-stream"}
+                if kind == "attachment":
+                    generic_types.add("binary/octet-stream")
+                    if ("openxmlformats" in mime_type or mime_type.startswith("application/vnd.oasis.")
+                            or mime_type.endswith(".macroenabled.12")):
+                        generic_types.update({"application/zip", "application/x-zip-compressed"})
+                compatible_text = kind == "attachment" and is_text_type(content_type) and is_text_type(mime_type)
+                if content_type not in generic_types and matching_type != mime_type and not compatible_text:
                     raise ValueError("Unexpected media content type")
                 content_length = media.headers.get("content-length")
                 if content_length is not None and int(content_length) > limit:
@@ -165,13 +179,14 @@ async def download_audio(media_id: str) -> tuple[bytes, str]:
     )
 
 
-async def download_attachment(media_id: str, media_kind: str) -> tuple[bytes, str]:
+async def download_attachment(media_id: str, media_kind: str, *, filename: str | None = None) -> tuple[bytes, str]:
     if media_kind not in {"image", "document"}:
         raise HTTPException(status_code=415, detail="Unsupported attachment kind")
     return await _download_media(
         media_id, allowed_types=IMAGE_MIME_TYPES if media_kind == "image" else SUPPORTED_MIME_TYPES,
         max_bytes=MAX_IMAGE_BYTES if media_kind == "image" else MAX_ATTACHMENT_BYTES,
         kind="attachment",
+        filename=filename,
     )
 
 
@@ -257,7 +272,11 @@ def _incoming_messages(event: object) -> list[IncomingMessage]:
                         raise ValueError("Expected media ID")
                     if media_url is not None and not _valid_media_url(media_url):
                         raise ValueError("Expected media URL")
-                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url, media_kind=media_kind))
+                    filename = media.get("filename") if media_kind == "document" else None
+                    if filename is not None and (not isinstance(filename, str) or len(filename) > 4096):
+                        raise ValueError("Expected attachment filename")
+                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url,
+                                                    media_kind=media_kind, filename=filename))
     return incoming
 
 
@@ -280,7 +299,11 @@ async def receive_webhook(request: Request, tasks: BackgroundTasks):
         elif message.media_kind == "audio":
             tasks.add_task(transcribe_and_reply, message.sender, message.media_id)
         else:
-            tasks.add_task(translate_attachment_and_reply, message.sender, message.media_id, message.media_kind)
+            if message.filename is not None:
+                tasks.add_task(translate_attachment_and_reply, message.sender, message.media_id,
+                               message.media_kind, filename=message.filename)
+            else:
+                tasks.add_task(translate_attachment_and_reply, message.sender, message.media_id, message.media_kind)
     return {"ok": True}
 
 
@@ -333,9 +356,11 @@ async def transcribe_and_reply(recipient: str, media_id: str) -> None:
     await send_text(recipient, reply)
 
 
-async def translate_attachment_and_reply(recipient: str, media_id: str, media_kind: str) -> None:
+async def translate_attachment_and_reply(
+    recipient: str, media_id: str, media_kind: str, *, filename: str | None = None,
+) -> None:
     try:
-        data, mime_type = await download_attachment(media_id, media_kind)
+        data, mime_type = await download_attachment(media_id, media_kind, filename=filename)
         parts = await translate_attachment(data, mime_type)
         if (not isinstance(parts, list) or not parts
                 or any(not isinstance(part, str) or not part.strip() or len(part) > 4096 for part in parts)):
@@ -343,7 +368,7 @@ async def translate_attachment_and_reply(recipient: str, media_id: str, media_ki
     except HTTPException as error:
         logger.error("Attachment download failed (HTTP %s)", error.status_code)
         if error.status_code == 415:
-            reply = "هالصيغة مش مدعومة حاليًا. ابعث صورة أو PDF أو Word أو PowerPoint أو ملف TXT."
+            reply = "هالصيغة مش مدعومة حاليًا. ابعث صورة أو PDF أو Word أو PowerPoint أو Excel أو ملف نصّي مثل TXT أو CSV."
         elif error.status_code == 413:
             reply = "الملف كبير. ابعث صورة أصغر من 5 ميغابايت أو مستند أصغر من 20 ميغابايت."
         else:

@@ -61,13 +61,14 @@ class AttachmentWebhookTests(unittest.IsolatedAsyncioTestCase):
             "X-Hub-Signature-256": "sha256=" + (signature if signed else "invalid"),
         })
 
-    async def test_images_and_documents_route_by_media_id_without_caption_or_filename(self):
+    async def test_images_and_documents_route_by_media_id_with_filename_as_a_hint_only(self):
         for kind in ("image", "document"):
             with self.subTest(kind=kind):
                 self.attachment.reset_mock()
                 response = await self.post_event(attachment_event(kind))
                 self.assertEqual(response.status_code, 200)
-                self.attachment.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, kind)
+                hint = {"filename": PRIVATE_FILENAME} if kind == "document" else {}
+                self.attachment.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, kind, **hint)
         self.text.assert_not_awaited()
         self.audio.assert_not_awaited()
 
@@ -84,7 +85,8 @@ class AttachmentWebhookTests(unittest.IsolatedAsyncioTestCase):
                         media.pop("url")
                     response = await self.post_event(event)
                     self.assertEqual(response.status_code, 200)
-                    self.attachment.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, kind)
+                    hint = {"filename": PRIVATE_FILENAME} if kind == "document" else {}
+                    self.attachment.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, kind, **hint)
 
     async def test_attachments_keep_signature_allowlist_phone_and_unknown_type_filters(self):
         cases = [
@@ -254,7 +256,7 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
                     with patch("whatsapp.send_text", new_callable=AsyncMock, return_value=True) as send:
                         with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                             await whatsapp.translate_attachment_and_reply(SECOND_SENDER, MEDIA_ID, "document")
-                download.assert_awaited_once_with(MEDIA_ID, "document")
+                download.assert_awaited_once_with(MEDIA_ID, "document", filename=None)
                 if stage == "download":
                     translate.assert_not_awaited()
                 send.assert_awaited_once()
@@ -271,7 +273,7 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
-    async def download(self, *, media_kind="document", metadata=None, media=None):
+    async def download(self, *, media_kind="document", metadata=None, media=None, filename=None):
         requests = []
         client_factory = httpx.AsyncClient
         if metadata is None:
@@ -300,7 +302,7 @@ class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
             try:
-                result = await whatsapp.download_attachment(MEDIA_ID, media_kind)
+                result = await whatsapp.download_attachment(MEDIA_ID, media_kind, filename=filename)
                 return result, requests, None
             except whatsapp.HTTPException as error:
                 return None, requests, error
@@ -318,6 +320,34 @@ class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(error)
                 self.assertEqual(result, (b"synthetic attachment", mime))
                 self.assertEqual(len(requests), 2)
+
+    async def test_generic_mime_uses_known_filename_hint_without_overriding_explicit_type(self):
+        for declared, filename, expected in (
+            ("application/octet-stream", "notes.md", "text/markdown"),
+            ("application/zip", "workbook.XLSX", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            ("application/octet-stream", "settings.json", "application/json"),
+        ):
+            with self.subTest(filename=filename):
+                result, requests, error = await self.download(
+                    filename=filename,
+                    metadata=httpx.Response(200, json={"url": MEDIA_URL, "mime_type": declared}),
+                    media=httpx.Response(200, content=b"synthetic attachment", headers={"Content-Type": declared}),
+                )
+                self.assertIsNone(error)
+                self.assertEqual(result, (b"synthetic attachment", expected))
+                self.assertEqual(len(requests), 2)
+        _, requests, error = await self.download(
+            filename="renamed.txt",
+            metadata=httpx.Response(200, json={"url": MEDIA_URL, "mime_type": "application/x-msdownload"}),
+        )
+        self.assertEqual(error.status_code, 415)
+        self.assertEqual(len(requests), 1)
+        result, _, error = await self.download(
+            metadata=httpx.Response(200, json={"url": MEDIA_URL, "mime_type": "text/csv"}),
+            media=httpx.Response(200, content=b"name,value\nHello,10", headers={"Content-Type": "text/plain"}),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(result[1], "text/csv")
 
     async def test_metadata_or_download_failures_are_general_errors_without_secrets(self):
         cases = [
