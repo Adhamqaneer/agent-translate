@@ -6,29 +6,20 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-import stt
+from app import stt
 
 
-API_KEY = "private-gemini-key"
-AUDIO = b"synthetic-audio-bytes"
-FILE_NAME = "files/synthetic-audio"
-FILE_URI = f"{stt.API_BASE}/v1beta/{FILE_NAME}"
-UPLOAD_URL = f"{stt.API_BASE}/upload/v1beta/files?upload_id=private-upload-session"
-
-
-def transcript_response(text="بالطريق، بوصل بعد عشر دقايق."):
-    return {"candidates": [{
-        "finishReason": "STOP", "content": {"parts": [{
-            "text": json.dumps({"transcript": text}, ensure_ascii=False),
-        }]},
-    }]}
+from tests.fixtures import (
+    STT_API_KEY as API_KEY, STT_AUDIO as AUDIO, STT_FILE_NAME as FILE_NAME,
+    STT_FILE_URI as FILE_URI, STT_UPLOAD_URL as UPLOAD_URL, transcript_response,
+)
 
 
 class SpeechTranscriptionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.sleep = AsyncMock()
-        self.sleep_patch = patch("stt.asyncio.sleep", self.sleep)
-        self.jitter_patch = patch("retry_http.random.uniform", return_value=0.0)
+        self.sleep_patch = patch("app.stt.asyncio.sleep", self.sleep)
+        self.jitter_patch = patch("app.retry_http.random.uniform", return_value=0.0)
         self.sleep_patch.start()
         self.jitter_patch.start()
         self.addCleanup(self.sleep_patch.stop)
@@ -195,7 +186,7 @@ class SpeechTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             requests.append(name)
             await original_delete(client, name, headers)
 
-        with patch("stt._delete_file", side_effect=record_delete), self.assertRaises(RuntimeError):
+        with patch("app.stt._delete_file", side_effect=record_delete), self.assertRaises(RuntimeError):
             await self.run_files_workflow(generation_status=403)
         self.assertEqual(requests, [FILE_NAME])
 
@@ -203,7 +194,7 @@ class SpeechTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         for state in ("FAILED", "PROCESSING"):
             with self.subTest(state=state):
                 deleted = AsyncMock()
-                with patch.object(stt, "FILE_POLL_ATTEMPTS", 2), patch("stt._delete_file", deleted):
+                with patch.object(stt, "FILE_POLL_ATTEMPTS", 2), patch("app.stt._delete_file", deleted):
                     with self.assertRaises(RuntimeError):
                         await self.run_files_workflow(initial_state=state, poll_state=state)
                 deleted.assert_awaited_once()
@@ -225,7 +216,7 @@ class SpeechTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self.run_files_workflow(upload_url="https://evil.invalid/upload/files")
         deleted = AsyncMock()
-        with patch("stt._delete_file", deleted), self.assertRaises(RuntimeError):
+        with patch("app.stt._delete_file", deleted), self.assertRaises(RuntimeError):
             await self.run_files_workflow(file_uri="https://evil.invalid/private-file")
         deleted.assert_awaited_once()
 
@@ -236,7 +227,7 @@ class SpeechTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         for configured, expected in cases:
             with self.subTest(expected=expected):
                 with patch.dict(os.environ, {**configured, "GEMINI_API_KEY": API_KEY}):
-                    with patch("stt.transcribe", new_callable=AsyncMock, return_value="original words") as transcribe:
+                    with patch("app.stt.transcribe", new_callable=AsyncMock, return_value="original words") as transcribe:
                         result = await stt.transcribe_audio(AUDIO, "audio/ogg")
                 self.assertEqual(result, "original words")
                 self.assertEqual(transcribe.await_args.kwargs, {"api_key": API_KEY, "model": expected})

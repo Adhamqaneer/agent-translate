@@ -6,30 +6,18 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import json
 import os
-import time
 import unittest
 from unittest.mock import AsyncMock, call, patch
-from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 
-import retry_http
-import translator
+from app import retry_http
+from app import translator
 
-# Unit tests use placeholders only. No .env or external services are accessed.
-TEST_SENDER = "962700000000"
-SECOND_SENDER = "962700000001"
-MEDIA_ID = "123456789012345"
-MEDIA_URL = "https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=123&token=private-media-token"
-OUTPUT_MEDIA_ID = "987654321012345"
-SYNTHESIZED_AUDIO = b"OggS" + b"\x00" * 24 + b"OpusHead-private-synthesized-audio"
-os.environ.update({
-    "WA_PHONE_NUMBER_ID": "123", "WA_ALLOWED_SENDERS": TEST_SENDER,
-    "WA_GRAPH_VERSION": "v25.0", "WA_ACCESS_TOKEN": "unit-test-token",
-    "META_APP_SECRET": "unit-test-secret", "WA_VERIFY_TOKEN": "unit-test-verify",
-    "GEMINI_API_KEY": "unit-test-key",
-})
-import whatsapp
+from tests.fixtures import (
+    TEST_SENDER, SECOND_SENDER, MEDIA_ID, MEDIA_URL, OUTPUT_MEDIA_ID, SYNTHESIZED_AUDIO,
+)
+from app import whatsapp
 
 
 class SenderConfigurationTests(unittest.TestCase):
@@ -68,8 +56,8 @@ class SenderConfigurationTests(unittest.TestCase):
 class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.sleep = AsyncMock()
-        self.sleep_patch = patch("retry_http.asyncio.sleep", self.sleep)
-        self.jitter_patch = patch("retry_http.random.uniform", return_value=0.0)
+        self.sleep_patch = patch("app.retry_http.asyncio.sleep", self.sleep)
+        self.jitter_patch = patch("app.retry_http.random.uniform", return_value=0.0)
         self.sleep_patch.start()
         self.jitter_patch.start()
         self.addCleanup(self.sleep_patch.stop)
@@ -101,7 +89,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         def fake_client(**kwargs):
             return client_factory(transport=httpx.MockTransport(handler), **kwargs)
 
-        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
+        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
             await whatsapp.translate_and_reply("962700000000", "synthetic source")
 
     async def test_success_has_no_retry_or_wait(self):
@@ -281,7 +269,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
                           + " phone ID 123456789012345"},
         }})
         error = httpx.HTTPStatusError("private-request-details", request=request, response=response)
-        with patch("whatsapp.post_with_retry", side_effect=error):
+        with patch("app.whatsapp.post_with_retry", side_effect=error):
             with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                 await whatsapp.send_text("962700000000", "private-message-text")
         output = "\n".join(recorded.output)
@@ -313,11 +301,11 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.reply = AsyncMock()
-        self.reply_patch = patch("whatsapp.translate_and_reply", self.reply)
+        self.reply_patch = patch("app.whatsapp.translate_and_reply", self.reply)
         self.reply_patch.start()
         self.addCleanup(self.reply_patch.stop)
         self.audio_reply = AsyncMock()
-        self.audio_reply_patch = patch("whatsapp.transcribe_and_reply", self.audio_reply)
+        self.audio_reply_patch = patch("app.whatsapp.transcribe_and_reply", self.audio_reply)
         self.audio_reply_patch.start()
         self.addCleanup(self.audio_reply_patch.stop)
         self.client = httpx.AsyncClient(
@@ -645,9 +633,9 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
         body = json.dumps(event).encode()
         signature = "sha256=" + hmac.new(whatsapp.APP_SECRET, body, hashlib.sha256).hexdigest()
         async with client_factory(transport=httpx.ASGITransport(app=whatsapp.app), base_url="http://test.invalid") as client:
-            with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client), patch("retry_http.asyncio.sleep", new_callable=AsyncMock):
+            with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client), patch("app.retry_http.asyncio.sleep", new_callable=AsyncMock):
                 with patch.object(whatsapp, "ALLOWED_SENDERS", frozenset({TEST_SENDER, SECOND_SENDER})):
-                    with patch("whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
+                    with patch("app.whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
                         with self.assertLogs(whatsapp.logger, level="INFO") as recorded:
                             response = await client.post(
                                 "/webhook/whatsapp", content=body, headers={"X-Hub-Signature-256": signature},
@@ -680,10 +668,10 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
                 stt = AsyncMock(return_value=transcript)
                 translate = AsyncMock(return_value="unused-translation")
                 {"download": download, "stt": stt, "translation": translate}[stage].side_effect = error
-                with patch("whatsapp.download_audio", download), patch("whatsapp.transcribe_audio", stt):
-                    with patch("whatsapp.translate_message", translate), patch("whatsapp.send_text", new_callable=AsyncMock) as send:
-                        with patch("whatsapp.synthesize_speech", new_callable=AsyncMock) as synthesize:
-                            with patch("whatsapp.send_voice", new_callable=AsyncMock) as voice:
+                with patch("app.whatsapp.download_audio", download), patch("app.whatsapp.transcribe_audio", stt):
+                    with patch("app.whatsapp.translate_message", translate), patch("app.whatsapp.send_text", new_callable=AsyncMock) as send:
+                        with patch("app.whatsapp.synthesize_speech", new_callable=AsyncMock) as synthesize:
+                            with patch("app.whatsapp.send_voice", new_callable=AsyncMock) as voice:
                                 with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                                     await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
                 synthesize.assert_not_awaited()
@@ -719,13 +707,13 @@ class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
         ]
         for tts_error, delivery, expect_text in cases:
             with self.subTest(tts_error=type(tts_error).__name__, delivery=delivery):
-                with patch("whatsapp.download_audio", new_callable=AsyncMock, return_value=(b"OggS-input", "audio/ogg")) as download:
-                    with patch("whatsapp.transcribe_audio", new_callable=AsyncMock, return_value=transcript) as stt:
-                        with patch("whatsapp.translate_message", new_callable=AsyncMock, return_value=translation) as translate:
-                            with patch("whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
+                with patch("app.whatsapp.download_audio", new_callable=AsyncMock, return_value=(b"OggS-input", "audio/ogg")) as download:
+                    with patch("app.whatsapp.transcribe_audio", new_callable=AsyncMock, return_value=transcript) as stt:
+                        with patch("app.whatsapp.translate_message", new_callable=AsyncMock, return_value=translation) as translate:
+                            with patch("app.whatsapp.synthesize_speech", new_callable=AsyncMock, return_value=SYNTHESIZED_AUDIO) as synthesize:
                                 synthesize.side_effect = tts_error
-                                with patch("whatsapp.send_voice", new_callable=AsyncMock, return_value=delivery) as voice:
-                                    with patch("whatsapp.send_text", new_callable=AsyncMock) as send:
+                                with patch("app.whatsapp.send_voice", new_callable=AsyncMock, return_value=delivery) as voice:
+                                    with patch("app.whatsapp.send_text", new_callable=AsyncMock) as send:
                                         with patch.object(whatsapp.logger, "error") as error_log, patch.object(whatsapp.logger, "warning") as warning_log:
                                             await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
                 download.assert_awaited_once_with(MEDIA_ID)
@@ -777,9 +765,9 @@ class VoiceDeliveryTests(unittest.IsolatedAsyncioTestCase):
             kwargs["transport"] = httpx.MockTransport(handler)
             return client_factory(**kwargs)
 
-        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
-            with patch("retry_http.asyncio.sleep", new_callable=AsyncMock) as sleep:
-                with patch("retry_http.random.uniform", return_value=0.0):
+        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
+            with patch("app.retry_http.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                with patch("app.retry_http.random.uniform", return_value=0.0):
                     with patch.object(whatsapp.logger, "error") as error_log, patch.object(whatsapp.logger, "warning") as warning_log:
                         result = await whatsapp.send_voice(SECOND_SENDER, SYNTHESIZED_AUDIO)
         output = str(error_log.call_args_list) + str(warning_log.call_args_list)
@@ -847,45 +835,8 @@ class VoiceDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(requests), 2)
 
 
-class AudioUrlTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.env_patch = patch.dict(os.environ, {
-            "PUBLIC_BASE_URL": "https://voice.example", "RENDER_EXTERNAL_URL": "https://fallback.onrender.com",
-        })
-        self.env_patch.start()
-        self.addCleanup(self.env_patch.stop)
-        self.client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=whatsapp.app), base_url="https://voice.example",
-        )
-
-    async def asyncTearDown(self):
-        await self.client.aclose()
-
-    def signed_path(self, *, media_id=MEDIA_ID, expires=None):
-        if expires is None:
-            expires = int(time.time()) + 600
-        signature = hmac.new(
-            whatsapp.APP_SECRET, f"audio:{media_id}:{expires}".encode(), hashlib.sha256,
-        ).hexdigest()
-        return f"/media/audio/{media_id}?" + urlencode({"expires": expires, "signature": signature})
-
-    def assert_safe_signed_link(self, link, *, base="https://voice.example"):
-        parsed = urlsplit(link)
-        self.assertEqual(f"{parsed.scheme}://{parsed.netloc}", base)
-        self.assertEqual(parsed.path, f"/media/audio/{MEDIA_ID}")
-        query = parse_qs(parsed.query)
-        self.assertEqual(set(query), {"expires", "signature"})
-        expires = int(query["expires"][0])
-        self.assertGreaterEqual(expires, int(time.time()) + 895)
-        self.assertLessEqual(expires, int(time.time()) + 900)
-        expected = hmac.new(
-            whatsapp.APP_SECRET, f"audio:{MEDIA_ID}:{expires}".encode(), hashlib.sha256,
-        ).hexdigest()
-        self.assertEqual(query["signature"], [expected])
-        for secret in (whatsapp.ACCESS_TOKEN, whatsapp.APP_SECRET.decode(), "private-media-token"):
-            self.assertNotIn(secret, link)
-
-    async def serve_link(self, *, metadata=None, audio_response=None, link=None):
+class AudioDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def download_audio(self, *, metadata=None, audio_response=None):
         requests = []
         client_factory = httpx.AsyncClient
         if metadata is None:
@@ -909,89 +860,37 @@ class AudioUrlTests(unittest.IsolatedAsyncioTestCase):
             return response
 
         def fake_client(**kwargs):
-            return client_factory(transport=httpx.MockTransport(handler), **kwargs)
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return client_factory(**kwargs)
 
-        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
-            with patch("whatsapp.translate_message", new_callable=AsyncMock) as translate:
-                response = await self.client.get(link or self.signed_path())
+        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
+            with patch("app.whatsapp.translate_message", new_callable=AsyncMock) as translate:
+                try:
+                    result = await whatsapp.download_audio(MEDIA_ID)
+                    error = None
+                except whatsapp.HTTPException as caught:
+                    result, error = None, caught
                 translate.assert_not_awaited()
-        return response, requests
+        return result, requests, error
 
-    async def test_audio_reply_builds_private_safe_link_without_media_lookup(self):
-        for media_url in (None, MEDIA_URL):
-            with self.subTest(webhook_url_present=media_url is not None):
-                with patch("whatsapp.send_text", new_callable=AsyncMock) as send:
-                    with patch("whatsapp.httpx.AsyncClient", side_effect=AssertionError("No media lookup during reply")):
-                        with patch("whatsapp.translate_message", new_callable=AsyncMock) as translate:
-                            await whatsapp.reply_with_audio_url(SECOND_SENDER, MEDIA_ID, media_url)
-                send.assert_awaited_once()
-                self.assertEqual(send.await_args.args[0], SECOND_SENDER)
-                self.assert_safe_signed_link(send.await_args.args[1])
-                translate.assert_not_awaited()
-
-    async def test_signed_link_uses_public_base_before_render_fallback(self):
-        self.assertEqual(whatsapp.AUDIO_LINK_TTL, 900)
-        self.assert_safe_signed_link(whatsapp.build_audio_link(MEDIA_ID))
-        with patch.dict(os.environ, {"PUBLIC_BASE_URL": ""}):
-            self.assert_safe_signed_link(
-                whatsapp.build_audio_link(MEDIA_ID), base="https://fallback.onrender.com",
-            )
-
-    async def test_missing_or_invalid_public_base_sends_one_fallback(self):
-        for base in ("", "http://voice.example", "https://user:password@voice.example", "https://voice.example/has space"):
-            with self.subTest(base=base), patch.dict(os.environ, {"PUBLIC_BASE_URL": base, "RENDER_EXTERNAL_URL": ""}):
-                with patch("whatsapp.send_text", new_callable=AsyncMock) as send:
-                    with patch("whatsapp.httpx.AsyncClient", side_effect=AssertionError("No media lookup during reply")):
-                        await whatsapp.reply_with_audio_url(SECOND_SENDER, MEDIA_ID, MEDIA_URL)
-                send.assert_awaited_once()
-                recipient, fallback = send.await_args.args
-                self.assertEqual(recipient, SECOND_SENDER)
-                self.assertTrue(any("\u0600" <= letter <= "\u06ff" for letter in fallback))
-                self.assertNotIn("https://", fallback)
-                self.assertNotIn(whatsapp.ACCESS_TOKEN, fallback)
-
-    async def test_tampering_and_expiry_are_rejected_before_any_outbound_request(self):
-        valid = self.signed_path()
-        query = parse_qs(urlsplit(valid).query)
-        changed_expiry = int(query["expires"][0]) + 1
-        cases = [
-            (valid.replace(MEDIA_ID, MEDIA_ID + "1"), 403),
-            (valid.replace(query["signature"][0], "0" * 64), 403),
-            (valid.replace(query["expires"][0], str(changed_expiry)), 403),
-            (self.signed_path(media_id="not-a-number"), 403),
-            (self.signed_path(expires=int(time.time()) - 1), 410),
-        ]
-        with patch("whatsapp.httpx.AsyncClient", side_effect=AssertionError("Invalid links must not contact Meta")):
-            for link, status in cases:
-                with self.subTest(status=status, link=link):
-                    response = await self.client.get(link)
-                    self.assertEqual(response.status_code, status)
-
-    async def test_signed_link_fetches_audio_with_security_headers(self):
-        link = whatsapp.build_audio_link(MEDIA_ID)
-        response, requests = await self.serve_link(link=link)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.content, b"OggS-synthetic-voice")
+    async def test_metadata_lookup_and_audio_download_are_authenticated_and_preserve_mime(self):
+        result, requests, error = await self.download_audio()
+        self.assertIsNone(error)
+        self.assertEqual(result, (b"OggS-synthetic-voice", "audio/ogg"))
         self.assertEqual(len(requests), 2)
-        self.assertTrue(response.headers["content-type"].startswith("audio/ogg"))
-        self.assertIn("inline", response.headers["content-disposition"])
-        self.assertIn(f"voice-{MEDIA_ID}.ogg", response.headers["content-disposition"])
-        self.assertEqual(response.headers["cache-control"], "no-store")
-        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
-        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
 
     async def test_untrusted_metadata_url_never_receives_authorization(self):
         bad_urls = [
             "https://attacker.example/audio", "https://lookaside.fbsbx.com.attacker.example/audio",
-            "http://lookaside.fbsbx.com/audio", "https://user:password@lookaside.fbsbx.com/audio",
+            "http://lookaside.fbsbx.com/audio", "https://user:secret@lookaside.fbsbx.com/audio",
             "https://lookaside.fbsbx.com:444/audio", "https://lookaside.fbsbx.com/audio\nprivate",
         ]
         for url in bad_urls:
             with self.subTest(url=url):
-                response, requests = await self.serve_link(metadata=httpx.Response(
+                _, requests, error = await self.download_audio(metadata=httpx.Response(
                     200, json={"url": url, "mime_type": "audio/ogg"},
                 ))
-                self.assertEqual(response.status_code, 502)
+                self.assertEqual(error.status_code, 502)
                 self.assertEqual(len(requests), 1)
 
     async def test_invalid_metadata_or_upstream_failures_are_private_safe(self):
@@ -1010,10 +909,10 @@ class AudioUrlTests(unittest.IsolatedAsyncioTestCase):
         for metadata, audio in cases:
             with self.subTest(metadata=metadata, audio=audio):
                 with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
-                    response, requests = await self.serve_link(metadata=metadata, audio_response=audio)
-                self.assertEqual(response.status_code, 502)
+                    _, requests, error = await self.download_audio(metadata=metadata, audio_response=audio)
+                self.assertEqual(error.status_code, 502)
                 self.assertLessEqual(len(requests), 2)
-                output = "\n".join(recorded.output) + response.text
+                output = "\n".join(recorded.output) + str(error.detail)
                 for private in (MEDIA_URL, whatsapp.ACCESS_TOKEN, "private-upstream-details", "attacker.example"):
                     self.assertNotIn(private, output)
 
@@ -1029,10 +928,10 @@ class AudioUrlTests(unittest.IsolatedAsyncioTestCase):
 
         stream = CountedAudio()
         with patch.object(whatsapp, "MAX_AUDIO_BYTES", 5):
-            response, _ = await self.serve_link(audio_response=httpx.Response(
+            _, _, error = await self.download_audio(audio_response=httpx.Response(
                 200, stream=stream, headers={"Content-Type": "audio/ogg"},
             ))
-        self.assertEqual(response.status_code, 413)
+        self.assertEqual(error.status_code, 413)
         self.assertEqual(stream.yielded, 2)
 
 

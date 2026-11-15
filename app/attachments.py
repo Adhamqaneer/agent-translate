@@ -4,18 +4,18 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import re
 
 import httpx
 
-from retry_http import post_with_retry
-from attachment_types import (
+from .gemini import get_settings, read_generated_text
+from .retry_http import post_with_retry
+from .attachment_types import (
     IMAGE_MIME_TYPES, RTF_MIME_TYPES, SPREADSHEET_MIME_TYPES,
-    SUPPORTED_MIME_TYPES, is_text_type, resolve_mime_type,
+    is_text_type, resolve_mime_type,
 )
-from spreadsheet_text import extract_spreadsheet
-from translator import DEFAULT_MODEL, INSTRUCTIONS, TARGET_LANGUAGES
+from .spreadsheet_text import extract_spreadsheet
+from .translator import DEFAULT_MODEL, INSTRUCTIONS, TARGET_LANGUAGES
 
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -161,30 +161,8 @@ def _parse_extraction(response: httpx.Response) -> tuple[str, str]:
 
 def _parse_translation(response: httpx.Response) -> str:
     try:
-        body = response.json()
-        candidates = body["candidates"]
-        if not isinstance(candidates, list) or not candidates:
-            raise ValueError
-        candidate = candidates[0]
-        if candidate.get("finishReason") != "STOP":
-            raise ValueError
-        parts = candidate["content"]["parts"]
-        if not isinstance(parts, list):
-            raise ValueError
-        texts = []
-        for part in parts:
-            if not isinstance(part, dict):
-                raise ValueError
-            if part.get("thought"):
-                continue
-            if not isinstance(part.get("text"), str):
-                raise ValueError
-            texts.append(part["text"])
-        translation = "".join(texts).strip()
-        if not translation:
-            raise ValueError
-        return translation
-    except (ValueError, TypeError, AttributeError, KeyError, IndexError):
+        return read_generated_text(response)
+    except RuntimeError:
         raise AttachmentError("Attachment translation was empty, incomplete, or invalid.") from None
 
 
@@ -213,9 +191,7 @@ async def translate_attachment(data: bytes, mime_type: str) -> list[str]:
             "mime_type": mime_type, "data": base64.b64encode(data).decode("ascii"),
         }
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = (os.getenv("GEMINI_ATTACHMENT_MODEL", "").strip()
-             or os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL)
+    api_key, model = get_settings("GEMINI_ATTACHMENT_MODEL", "GEMINI_MODEL", default=DEFAULT_MODEL)
     if not api_key or not re.fullmatch(r"gemini-[a-z0-9.-]+", model):
         raise AttachmentError("Check the Gemini attachment settings before translating.")
     headers = {"x-goog-api-key": api_key}
@@ -232,7 +208,7 @@ async def translate_attachment(data: bytes, mime_type: str) -> list[str]:
             )
             response.raise_for_status()
             extracted, target = _parse_extraction(response)
-            # UTF-8 text is already available losslessly; the model selects direction.
+            # Local readers preserve the source text; the model selects direction.
             source = original_text if original_text is not None else extracted
             source_chunks = _split_text(source, SOURCE_CHUNK_CHARS)
             instructions = INSTRUCTIONS + (

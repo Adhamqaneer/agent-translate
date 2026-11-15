@@ -34,7 +34,7 @@ TEXT_MIME_TYPES = frozenset({
     "application/x-yaml", "application/sql", "application/x-python-code",
     "application/x-latex", "image/svg+xml",
 })
-# This finite catalog is useful for documentation. is_supported_type also
+# This finite catalog is useful for documentation. resolve_mime_type also
 # recognizes valid text/* subtypes beyond those listed here.
 SUPPORTED_MIME_TYPES = (
     IMAGE_MIME_TYPES | DOCUMENT_MIME_TYPES | SPREADSHEET_MIME_TYPES
@@ -130,13 +130,8 @@ def resolve_mime_type(mime_type: object, filename: str | None = None) -> str | N
 
 
 def is_text_type(mime: str) -> bool:
-    """Identify types decoded as UTF-8, excluding structured RTF payloads."""
+    """Identify plain-text types, excluding structured RTF payloads."""
     normalized = resolve_mime_type(mime)
     return normalized is not None and (
         normalized in TEXT_MIME_TYPES or normalized.startswith("text/")
     )
-
-
-def is_supported_type(mime: str) -> bool:
-    """Check a MIME header independently of any optional filename hint."""
-    return resolve_mime_type(mime) is not None

@@ -1,16 +1,15 @@
 import argparse
 import asyncio
-import os
 import re
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 
-from retry_http import post_with_retry
+from .gemini import DEFAULT_MODEL, get_settings, read_generated_text
+from .retry_http import post_with_retry
 
 
-DEFAULT_MODEL = "gemini-3.1-flash-lite"
 TARGET_LANGUAGES = {"ar": "Arabic", "en": "English"}
 INSTRUCTIONS = """
 You are a dedicated Arabic-English translator for WhatsApp messages.
@@ -142,33 +141,20 @@ async def translate(
         },
     )
     response.raise_for_status()
-    try:
-        candidates = response.json().get("candidates") or []
-        if not candidates or candidates[0].get("finishReason") != "STOP":
-            raise RuntimeError("الترجمة ما اكتملت. جرّب صياغة الرسالة من جديد.")
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        translation = "".join(
-            part.get("text", "") for part in parts if not part.get("thought")
-        ).strip()
-    except (AttributeError, TypeError, KeyError, IndexError) as error:
-        raise RuntimeError("Unexpected Gemini response format. Try again later.") from error
-    if not translation:
-        raise RuntimeError("الترجمة رجعت فاضية. جرّب مرة ثانية.")
+    translation = read_generated_text(response)
     if len(translation) > 4096:
         raise RuntimeError("الترجمة طويلة على رسالة واحدة. ابعت النص على أجزاء.")
     return translation
 
 
 async def translate_message(message: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
+    api_key, model = get_settings("GEMINI_MODEL", default=DEFAULT_MODEL)
     async with httpx.AsyncClient(timeout=30) as client:
         return await translate(message, client, api_key=api_key, model=model)
 
 
 def main() -> int:
-    load_dotenv(Path(__file__).with_name(".env"))
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     parser = argparse.ArgumentParser(description="Translate an Arabic or English WhatsApp message.")
     parser.add_argument("message", help="Message to translate, optionally prefixed by ar: or en:.")
     args = parser.parse_args()

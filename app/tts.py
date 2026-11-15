@@ -11,7 +11,8 @@ import wave
 
 import httpx
 
-from retry_http import post_with_retry
+from .gemini import get_settings
+from .retry_http import post_with_retry
 
 
 DEFAULT_MODEL = "gemini-3.8-flash-tts"
@@ -197,8 +198,7 @@ async def synthesize(
 
 
 async def synthesize_speech(text: str) -> bytes:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_TTS_MODEL", "").strip() or DEFAULT_MODEL
+    api_key, model = get_settings("GEMINI_TTS_MODEL", default=DEFAULT_MODEL)
     voice = os.getenv("GEMINI_TTS_VOICE", "").strip() or DEFAULT_VOICE
     async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
         return await synthesize(text, client, api_key=api_key, model=model, voice=voice)

@@ -4,13 +4,12 @@ import asyncio
 import base64
 import json
 import logging
-import os
 import re
 
 import httpx
 
-from retry_http import post_with_retry
-from translator import DEFAULT_MODEL
+from .gemini import DEFAULT_MODEL, get_settings, read_generated_text
+from .retry_http import post_with_retry
 
 
 API_BASE = "https://generativelanguage.googleapis.com"
@@ -47,34 +46,14 @@ speaker labels, timestamps, explanations, summaries, or Markdown fences.
 
 def _parse_transcript(response: httpx.Response) -> str:
     try:
-        body = response.json()
-        candidates = body["candidates"]
-        if not isinstance(candidates, list) or not candidates:
-            raise ValueError
-        candidate = candidates[0]
-        if candidate.get("finishReason") != "STOP":
-            raise ValueError
-        parts = candidate["content"]["parts"]
-        if not isinstance(parts, list):
-            raise ValueError
-        texts = []
-        for part in parts:
-            if not isinstance(part, dict):
-                raise ValueError
-            if part.get("thought"):
-                continue
-            text = part.get("text")
-            if not isinstance(text, str):
-                raise ValueError
-            texts.append(text)
-        result = json.loads("".join(texts))
+        result = json.loads(read_generated_text(response))
         if not isinstance(result, dict) or set(result) != {"transcript"}:
             raise ValueError
         transcript = result["transcript"]
         if not isinstance(transcript, str) or not transcript.strip():
             raise ValueError
         return transcript.strip()
-    except (ValueError, TypeError, AttributeError, KeyError, IndexError):
+    except (ValueError, TypeError, RuntimeError):
         raise RuntimeError("Speech transcription was empty, incomplete, or invalid.") from None
 
 
@@ -216,8 +195,6 @@ async def transcribe(
 
 
 async def transcribe_audio(audio: bytes, mime_type: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = (os.getenv("GEMINI_STT_MODEL", "").strip()
-             or os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL)
+    api_key, model = get_settings("GEMINI_STT_MODEL", "GEMINI_MODEL", default=DEFAULT_MODEL)
     async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
         return await transcribe(audio, mime_type, client, api_key=api_key, model=model)

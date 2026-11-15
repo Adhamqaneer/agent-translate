@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 import zipfile
 
-import spreadsheet_text
+from app import spreadsheet_text
 
 
 def make_zip(entries):
@@ -151,7 +151,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         text = spreadsheet_text.extract_spreadsheet(make_xlsx(empty_sheet=True))
         self.assertIn('Sheet 3: "Empty"\n[Empty sheet]', text)
         workbook = FakeWorkbook({"Only Empty": FakeSheet([], start=None)})
-        with patch("spreadsheet_text._open_workbook", return_value=workbook):
+        with patch("app.spreadsheet_text._open_workbook", return_value=workbook):
             self.assertIn("[Empty sheet]", spreadsheet_text._extract_spreadsheet_core(b"fake"))
         self.assertTrue(workbook.closed)
 
@@ -160,7 +160,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
                   time(1, 2, 3, 456789), timedelta(days=1, microseconds=1), 123456789012345,
                   0.12345678901234566, False, "a\tb\nc", "", None]
         workbook = FakeWorkbook({"Typed": FakeSheet([values])})
-        with patch("spreadsheet_text._open_workbook", return_value=workbook):
+        with patch("app.spreadsheet_text._open_workbook", return_value=workbook):
             text = spreadsheet_text._extract_spreadsheet_core(b"fake")
         row = next(row for row in csv.reader(StringIO(text), delimiter="\t") if row and row[0] == "Row 1")
         self.assertEqual(row[1:], ["2026-11-15", "2026-11-15T12:34:56+00:00", "01:02:03.456789",
@@ -171,7 +171,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
     def test_large_sheet_is_rejected_before_iterating_or_converting_rows(self):
         sheet = FakeSheet([], start=(0, 0), end=(999_999, 16_383))
         workbook = FakeWorkbook({"Huge": sheet})
-        with patch("spreadsheet_text._open_workbook", return_value=workbook):
+        with patch("app.spreadsheet_text._open_workbook", return_value=workbook):
             with self.assertRaisesRegex(ValueError, spreadsheet_text.ERROR_MESSAGE):
                 spreadsheet_text._extract_spreadsheet_core(b"fake")
         self.assertFalse(sheet.iterated)
@@ -185,7 +185,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         ]
         for limit, maximum, workbook in cases:
             with self.subTest(limit=limit):
-                with patch.object(spreadsheet_text, limit, maximum), patch("spreadsheet_text._open_workbook", return_value=workbook):
+                with patch.object(spreadsheet_text, limit, maximum), patch("app.spreadsheet_text._open_workbook", return_value=workbook):
                     with self.assertRaises(ValueError) as caught:
                         spreadsheet_text._extract_spreadsheet_core(b"fake")
                 self.assertEqual(str(caught.exception), spreadsheet_text.ERROR_MESSAGE)
@@ -207,7 +207,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
             with self.subTest(data=data), self.assertRaises(ValueError) as caught:
                 spreadsheet_text._extract_spreadsheet_core(data)
             self.assertEqual(str(caught.exception), spreadsheet_text.ERROR_MESSAGE)
-        with patch("spreadsheet_text._open_workbook", side_effect=RuntimeError("private-filename secret-cell")):
+        with patch("app.spreadsheet_text._open_workbook", side_effect=RuntimeError("private-filename secret-cell")):
             with self.assertRaises(ValueError) as caught:
                 spreadsheet_text._extract_spreadsheet_core(b"fake")
         self.assertEqual(str(caught.exception), spreadsheet_text.ERROR_MESSAGE)
@@ -217,7 +217,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         cases = [("MAX_FILE_BYTES", 3, b"four"),
                  ("MAX_ZIP_ENTRIES", 1, make_zip(entries)),
                  ("MAX_UNCOMPRESSED_BYTES", 9, make_zip(entries))]
-        with patch("spreadsheet_text._open_workbook") as loader:
+        with patch("app.spreadsheet_text._open_workbook") as loader:
             for limit, maximum, data in cases:
                 with self.subTest(limit=limit), patch.object(spreadsheet_text, limit, maximum):
                     with self.assertRaises(ValueError):
@@ -237,7 +237,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         ods_encrypted = make_zip({"META-INF/manifest.xml":
             '<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
             '<manifest:file-entry><manifest:encryption-data/></manifest:file-entry></manifest:manifest>'})
-        with patch("spreadsheet_text._open_workbook") as loader:
+        with patch("app.spreadsheet_text._open_workbook") as loader:
             for data in (bytes(encrypted), xlsx, ods, dtd, ods_encrypted):
                 with self.subTest(length=len(data)), self.assertRaises(ValueError):
                     spreadsheet_text._extract_spreadsheet_core(data)
@@ -255,7 +255,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         for failure in failures:
             with self.subTest(failure=type(failure).__name__):
                 options = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
-                with patch("spreadsheet_text.subprocess.run", **options) as run:
+                with patch("app.spreadsheet_text.subprocess.run", **options) as run:
                     with self.assertRaises(ValueError) as caught:
                         spreadsheet_text.extract_spreadsheet(private_data)
                 self.assertEqual(str(caught.exception), spreadsheet_text.ERROR_MESSAGE)
@@ -268,7 +268,7 @@ class SpreadsheetExtractionTests(unittest.TestCase):
                 self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
                 self.assertFalse(kwargs.get("shell", False))
                 self.assertNotIn("preexec_fn", kwargs)
-        with patch("spreadsheet_text.subprocess.run") as run:
+        with patch("app.spreadsheet_text.subprocess.run") as run:
             with self.assertRaises(ValueError):
                 spreadsheet_text.extract_spreadsheet(b"")
             run.assert_not_called()
@@ -279,10 +279,10 @@ class SpreadsheetExtractionTests(unittest.TestCase):
         output = BytesIO()
         calls.parse.return_value = 'Sheet 1: "Test"\n[Empty sheet]'
         with patch.dict(sys.modules, {"resource": fake_resource}):
-            with patch("spreadsheet_text.sys.platform", "linux"):
-                with patch("spreadsheet_text.sys.stdin", SimpleNamespace(buffer=BytesIO(b"private bytes"))):
-                    with patch("spreadsheet_text.sys.stdout", SimpleNamespace(buffer=output)):
-                        with patch("spreadsheet_text._extract_spreadsheet_core", calls.parse):
+            with patch("app.spreadsheet_text.sys.platform", "linux"):
+                with patch("app.spreadsheet_text.sys.stdin", SimpleNamespace(buffer=BytesIO(b"private bytes"))):
+                    with patch("app.spreadsheet_text.sys.stdout", SimpleNamespace(buffer=output)):
+                        with patch("app.spreadsheet_text._extract_spreadsheet_core", calls.parse):
                             spreadsheet_text._worker_main()
         self.assertEqual(calls.mock_calls, [
             call.limit(1, (256 * 1024 * 1024, 256 * 1024 * 1024)),

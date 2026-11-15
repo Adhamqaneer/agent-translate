@@ -4,22 +4,20 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse
 
-from attachments import (
-    IMAGE_MIME_TYPES, MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES,
-    SUPPORTED_MIME_TYPES, translate_attachment,
+from .attachments import (
+    MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES, translate_attachment,
 )
-from attachment_types import is_text_type, resolve_mime_type
-from retry_http import SAFE_CONNECTION_ERRORS, post_with_retry, response_error
-from stt import transcribe_audio
-from tts import synthesize_speech
-from translator import translate_message
+from .attachment_types import IMAGE_MIME_TYPES, SUPPORTED_MIME_TYPES, is_text_type, resolve_mime_type
+from .retry_http import SAFE_CONNECTION_ERRORS, post_with_retry, response_error
+from .stt import transcribe_audio
+from .tts import synthesize_speech
+from .translator import translate_message
 
 
 def _load_allowed_senders() -> frozenset[str]:
@@ -49,13 +47,9 @@ if not (
 
 MESSAGES_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/messages"
 MEDIA_UPLOAD_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/media"
-AUDIO_LINK_TTL = 15 * 60
 MAX_AUDIO_BYTES = 16 * 1024 * 1024
 MEDIA_DOWNLOAD_HOSTS = frozenset({"lookaside.fbsbx.com", "lookaside.facebook.com"})
-AUDIO_EXTENSIONS = {
-    "audio/aac": "aac", "audio/amr": "amr", "audio/mpeg": "mp3",
-    "audio/mp4": "m4a", "audio/ogg": "ogg",
-}
+AUDIO_MIME_TYPES = frozenset({"audio/aac", "audio/amr", "audio/mpeg", "audio/mp4", "audio/ogg"})
 
 
 @dataclass(frozen=True)
@@ -63,7 +57,6 @@ class IncomingMessage:
     sender: str
     text: str | None = None
     media_id: str | None = None
-    media_url: str | None = None
     media_kind: str = "audio"
     filename: str | None = None
 
@@ -78,26 +71,6 @@ def _valid_media_url(value: object) -> bool:
     except httpx.InvalidURL:
         return False
     return url.scheme == "https" and bool(url.host) and not url.userinfo
-
-
-def _audio_signature(media_id: str, expires: int) -> str:
-    payload = f"audio:{media_id}:{expires}".encode()
-    return hmac.new(APP_SECRET, payload, hashlib.sha256).hexdigest()
-
-
-def build_audio_link(media_id: str) -> str:
-    if not re.fullmatch(r"[0-9]+", media_id):
-        raise ValueError("Invalid audio media ID")
-    base = (os.getenv("PUBLIC_BASE_URL", "").strip()
-            or os.getenv("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
-    if not _valid_media_url(base):
-        raise ValueError("Set PUBLIC_BASE_URL to the service's public HTTPS origin")
-    url = httpx.URL(base)
-    if url.path not in {"", "/"} or url.query or url.fragment:
-        raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
-    expires = int(time.time()) + AUDIO_LINK_TTL
-    signature = _audio_signature(media_id, expires)
-    return f"{base}/media/audio/{media_id}?expires={expires}&signature={signature}"
 
 
 async def _download_media(
@@ -175,7 +148,7 @@ async def _download_media(
 
 async def download_audio(media_id: str) -> tuple[bytes, str]:
     return await _download_media(
-        media_id, allowed_types=frozenset(AUDIO_EXTENSIONS), max_bytes=MAX_AUDIO_BYTES, kind="audio",
+        media_id, allowed_types=AUDIO_MIME_TYPES, max_bytes=MAX_AUDIO_BYTES, kind="audio",
     )
 
 
@@ -188,25 +161,6 @@ async def download_attachment(media_id: str, media_kind: str, *, filename: str |
         kind="attachment",
         filename=filename,
     )
-
-
-@app.get("/media/audio/{media_id}")
-async def serve_audio(media_id: str, expires: int, signature: str):
-    if not re.fullmatch(r"[0-9]+", media_id):
-        raise HTTPException(status_code=403, detail="Invalid audio link")
-    expected = _audio_signature(media_id, expires).encode()
-    if not hmac.compare_digest(signature.encode(), expected):
-        raise HTTPException(status_code=403, detail="Invalid audio link")
-    if expires <= time.time():
-        raise HTTPException(status_code=410, detail="Audio link expired. Send the voice note again.")
-
-    content, mime_type = await download_audio(media_id)
-    return Response(content=content, media_type=mime_type, headers={
-        "Content-Disposition": f'inline; filename="voice-{media_id}.{AUDIO_EXTENSIONS[mime_type]}"',
-        "Cache-Control": "no-store",
-        "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
-    })
 
 
 @app.get("/health")
@@ -275,7 +229,7 @@ def _incoming_messages(event: object) -> list[IncomingMessage]:
                     filename = media.get("filename") if media_kind == "document" else None
                     if filename is not None and (not isinstance(filename, str) or len(filename) > 4096):
                         raise ValueError("Expected attachment filename")
-                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url,
+                    incoming.append(IncomingMessage(sender, media_id=media_id,
                                                     media_kind=media_kind, filename=filename))
     return incoming
 
@@ -387,19 +341,6 @@ async def translate_attachment_and_reply(
     await send_text(recipient, reply, log_details=False)
 
 
-async def reply_with_audio_url(
-    recipient: str, media_id: str, media_url: str | None = None,
-) -> None:
-    """Return a signed browser link; keep Meta's access token on the server."""
-    try:
-        reply = build_audio_link(media_id)
-    except ValueError:
-        logger.error("Audio link could not be created; check the public service URL")
-        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
-
-    await send_text(recipient, reply)
-
-
 def _error_summary(details: dict, recipient: str, text: str) -> str:
     extra = details.get("error_data")
     description = str(details.get("message") or "")
@@ -412,6 +353,16 @@ def _error_summary(details: dict, recipient: str, text: str) -> str:
             description = description.replace(value, "[redacted]")
     description = re.sub(r"\b[0-9]{6,}\b", "[id]", description)
     return " ".join(description.split())[:500]
+
+
+def _message_accepted(response: httpx.Response) -> bool:
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    return bool(isinstance(messages, list) and messages and isinstance(messages[0], dict)
+                and isinstance(messages[0].get("id"), str) and messages[0]["id"].strip())
 
 
 async def send_text(recipient: str, text: str, *, log_details: bool = True) -> bool:
@@ -430,11 +381,9 @@ async def send_text(recipient: str, text: str, *, log_details: bool = True) -> b
                 },
             )
             response.raise_for_status()
-            payload = response.json()
-            messages = payload.get("messages") if isinstance(payload, dict) else None
-            if (not isinstance(messages, list) or not messages or not isinstance(messages[0], dict)
-                    or not isinstance(messages[0].get("id"), str) or not messages[0]["id"].strip()):
-                raise ValueError("Unconfirmed text reply")
+            if not _message_accepted(response):
+                logger.error("Meta returned an unconfirmed text reply response")
+                return False
             logger.info("WhatsApp accepted the outgoing reply")
             return True
     except httpx.HTTPStatusError as error:
@@ -449,8 +398,6 @@ async def send_text(recipient: str, text: str, *, log_details: bool = True) -> b
             logger.error("Meta rejected attachment text reply (HTTP %s, code %s)", error.response.status_code, code)
     except httpx.RequestError as error:
         logger.error("WhatsApp reply was not confirmed (%s)", type(error).__name__)
-    except ValueError:
-        logger.error("Meta returned an unconfirmed text reply response")
     return False
 
 
@@ -511,13 +458,7 @@ async def send_voice(recipient: str, audio: bytes) -> str:
         except httpx.RequestError as error:
             logger.error("Voice reply was not confirmed (%s)", type(error).__name__)
             return "uncertain"
-        try:
-            payload = response.json()
-            messages = payload.get("messages") if isinstance(payload, dict) else None
-            if (not isinstance(messages, list) or not messages or not isinstance(messages[0], dict)
-                    or not isinstance(messages[0].get("id"), str) or not messages[0]["id"].strip()):
-                raise ValueError("Unconfirmed voice reply")
-        except ValueError:
+        if not _message_accepted(response):
             logger.error("Meta returned an unconfirmed voice reply response")
             return "uncertain"
     logger.info("WhatsApp accepted the outgoing voice reply")

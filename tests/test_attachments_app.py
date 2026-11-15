@@ -9,14 +9,10 @@ from unittest.mock import AsyncMock, call, patch
 
 import httpx
 
-# Importing the existing fixture module sets placeholder credentials only.
-from test_app import MEDIA_ID, MEDIA_URL, SECOND_SENDER, TEST_SENDER
-import whatsapp
-
-
-JPEG_BYTES = b"\xff\xd8\xff\xe0synthetic-private-image\xff\xd9"
-PRIVATE_FILENAME = "private-financial-document.docx"
-PRIVATE_CAPTION = "private caption that must not enter the translation pipeline"
+from tests.fixtures import (
+    MEDIA_ID, MEDIA_URL, SECOND_SENDER, TEST_SENDER, JPEG_BYTES, PRIVATE_FILENAME, PRIVATE_CAPTION,
+)
+from app import whatsapp
 
 
 def attachment_event(kind="image", *, sender=TEST_SENDER, phone_id=None):
@@ -44,7 +40,7 @@ class AttachmentWebhookTests(unittest.IsolatedAsyncioTestCase):
         self.attachment = AsyncMock()
         for name, mock in (("translate_and_reply", self.text), ("transcribe_and_reply", self.audio),
                            ("translate_attachment_and_reply", self.attachment)):
-            patcher = patch(f"whatsapp.{name}", mock)
+            patcher = patch(f"app.whatsapp.{name}", mock)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.client = httpx.AsyncClient(
@@ -172,10 +168,10 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
             kwargs["transport"] = httpx.MockTransport(handler)
             return client_factory(**kwargs)
 
-        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
-            with patch("whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts) as translate:
-                with patch("whatsapp.transcribe_audio", new_callable=AsyncMock) as stt:
-                    with patch("whatsapp.synthesize_speech", new_callable=AsyncMock) as tts:
+        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
+            with patch("app.whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts) as translate:
+                with patch("app.whatsapp.transcribe_audio", new_callable=AsyncMock) as stt:
+                    with patch("app.whatsapp.synthesize_speech", new_callable=AsyncMock) as tts:
                         with self.assertLogs(whatsapp.logger, level="INFO") as recorded:
                             await whatsapp.translate_attachment_and_reply(SECOND_SENDER, MEDIA_ID, "image")
         translate.assert_awaited_once_with(JPEG_BYTES, "image/jpeg")
@@ -192,9 +188,9 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
         for accepted in ([False], [True, False]):
             with self.subTest(accepted=accepted):
                 parts = ["first translation", "second translation", "third translation"]
-                with patch("whatsapp.download_attachment", new_callable=AsyncMock, return_value=(JPEG_BYTES, "image/jpeg")):
-                    with patch("whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts) as translate:
-                        with patch("whatsapp.send_text", new_callable=AsyncMock, side_effect=accepted) as send:
+                with patch("app.whatsapp.download_attachment", new_callable=AsyncMock, return_value=(JPEG_BYTES, "image/jpeg")):
+                    with patch("app.whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts) as translate:
+                        with patch("app.whatsapp.send_text", new_callable=AsyncMock, side_effect=accepted) as send:
                             await whatsapp.translate_attachment_and_reply(SECOND_SENDER, MEDIA_ID, "document")
                 translate.assert_awaited_once_with(JPEG_BYTES, "image/jpeg")
                 self.assertEqual(send.await_args_list, [
@@ -228,9 +224,9 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
                     kwargs["transport"] = httpx.MockTransport(handler)
                     return client_factory(**kwargs)
 
-                with patch("whatsapp.download_attachment", new_callable=AsyncMock, return_value=(JPEG_BYTES, "image/jpeg")):
-                    with patch("whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts):
-                        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
+                with patch("app.whatsapp.download_attachment", new_callable=AsyncMock, return_value=(JPEG_BYTES, "image/jpeg")):
+                    with patch("app.whatsapp.translate_attachment", new_callable=AsyncMock, return_value=parts):
+                        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
                             with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                                 await whatsapp.translate_attachment_and_reply(SECOND_SENDER, MEDIA_ID, "document")
                 self.assertEqual(sends, parts[:len(responses)])
@@ -252,8 +248,8 @@ class AttachmentPipelineTests(unittest.IsolatedAsyncioTestCase):
                 download = AsyncMock(return_value=(JPEG_BYTES, "image/jpeg"))
                 translate = AsyncMock(return_value=["unused text"])
                 (download if stage == "download" else translate).side_effect = error
-                with patch("whatsapp.download_attachment", download), patch("whatsapp.translate_attachment", translate):
-                    with patch("whatsapp.send_text", new_callable=AsyncMock, return_value=True) as send:
+                with patch("app.whatsapp.download_attachment", download), patch("app.whatsapp.translate_attachment", translate):
+                    with patch("app.whatsapp.send_text", new_callable=AsyncMock, return_value=True) as send:
                         with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
                             await whatsapp.translate_attachment_and_reply(SECOND_SENDER, MEDIA_ID, "document")
                 download.assert_awaited_once_with(MEDIA_ID, "document", filename=None)
@@ -300,7 +296,7 @@ class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
             kwargs["transport"] = httpx.MockTransport(handler)
             return client_factory(**kwargs)
 
-        with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client):
+        with patch("app.whatsapp.httpx.AsyncClient", side_effect=fake_client):
             try:
                 result = await whatsapp.download_attachment(MEDIA_ID, media_kind, filename=filename)
                 return result, requests, None

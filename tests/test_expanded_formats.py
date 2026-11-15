@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import httpx
 
-import attachments
-from test_attachments import extraction_response, translation_response
+from app import attachments
+from tests.fixtures import extraction_response, translation_response
 
 
 class ExpandedFormatTests(unittest.IsolatedAsyncioTestCase):
@@ -30,7 +30,7 @@ class ExpandedFormatTests(unittest.IsolatedAsyncioTestCase):
             return client_factory(transport=httpx.MockTransport(handler), **kwargs)
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-format-key", "GEMINI_ATTACHMENT_MODEL": "gemini-format"}):
-            with patch("attachments.httpx.AsyncClient", side_effect=fake_client):
+            with patch("app.attachments.httpx.AsyncClient", side_effect=fake_client):
                 result = await attachments.translate_attachment(data, mime)
         self.assertEqual(result, ["Translated content"])
         self.assertEqual(len(calls), 2)
@@ -62,16 +62,16 @@ class ExpandedFormatTests(unittest.IsolatedAsyncioTestCase):
     async def test_spreadsheet_all_sheet_text_uses_local_content_not_model_copy(self):
         text = "Sheet 1: First\n1\tHello\t10\n\nSheet 2: Second\n1\tمرحبا\t20"
         for mime in sorted(attachments.SPREADSHEET_MIME_TYPES):
-            with self.subTest(mime=mime), patch("attachments.extract_spreadsheet", return_value=text) as reader:
+            with self.subTest(mime=mime), patch("app.attachments.extract_spreadsheet", return_value=text) as reader:
                 await self.translate(b"synthetic workbook", mime, text)
                 reader.assert_called_once_with(b"synthetic workbook")
 
     async def test_invalid_rtf_or_local_workbook_does_not_call_gemini(self):
-        with patch("attachments.httpx.AsyncClient", side_effect=AssertionError("No network for invalid local files")):
+        with patch("app.attachments.httpx.AsyncClient", side_effect=AssertionError("No network for invalid local files")):
             for rtf in (b"not RTF", br"{\rtf1 unclosed", br"{\rtf1 }", b"{\\rtf1 bad\x00content}"):
                 with self.subTest(rtf=rtf), self.assertRaises(attachments.AttachmentError):
                     await attachments.translate_attachment(rtf, "application/rtf")
-            with patch("attachments.extract_spreadsheet", side_effect=ValueError("Invalid workbook")):
+            with patch("app.attachments.extract_spreadsheet", side_effect=ValueError("Invalid workbook")):
                 with self.assertRaises(ValueError):
                     await attachments.translate_attachment(b"broken workbook", "application/vnd.ms-excel")
 

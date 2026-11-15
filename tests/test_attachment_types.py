@@ -1,13 +1,12 @@
 import unittest
 from unittest.mock import patch
 
-from attachment_types import (
+from app.attachment_types import (
     DOCUMENT_MIME_TYPES,
     IMAGE_MIME_TYPES,
     RTF_MIME_TYPES,
     SPREADSHEET_MIME_TYPES,
     SUPPORTED_MIME_TYPES,
-    is_supported_type,
     is_text_type,
     resolve_mime_type,
 )
@@ -47,7 +46,7 @@ class AttachmentTypeTests(unittest.TestCase):
         self.assertEqual(resolve_mime_type("application/x-pdf"), "application/pdf")
         self.assertEqual(resolve_mime_type("text/x-markdown"), "text/markdown")
         self.assertEqual(resolve_mime_type("application/x-msexcel"), "application/vnd.ms-excel")
-        self.assertTrue(is_supported_type("IMAGE/JPG; name=sample.jpg"))
+        self.assertEqual(resolve_mime_type("IMAGE/JPG; name=sample.jpg"), "image/jpeg")
 
     def test_rtf_is_structured_and_richtext_remains_a_distinct_text_format(self):
         self.assertEqual(resolve_mime_type("text/rtf"), "application/rtf")
@@ -97,7 +96,7 @@ class AttachmentTypeTests(unittest.TestCase):
     def test_arbitrary_valid_text_subtypes_preserve_their_actual_type(self):
         self.assertEqual(resolve_mime_type("text/x-custom-source; charset=utf-8"), "text/x-custom-source")
         self.assertTrue(is_text_type("text/vnd.example+source"))
-        self.assertTrue(is_supported_type("text/x-unlisted-format"))
+        self.assertEqual(resolve_mime_type("text/x-unlisted-format"), "text/x-unlisted-format")
         self.assertTrue(is_text_type("application/xhtml+xml"))
         self.assertTrue(is_text_type("application/x-python-code"))
         self.assertFalse(is_text_type("image/jpeg"))
@@ -112,7 +111,6 @@ class AttachmentTypeTests(unittest.TestCase):
         for value in malformed:
             with self.subTest(value=value):
                 self.assertIsNone(resolve_mime_type(value, "safe.txt"))
-                self.assertFalse(is_supported_type(value))
 
     def test_filename_is_only_a_suffix_hint_and_never_a_path_or_command(self):
         with patch("builtins.open", side_effect=AssertionError("unexpected file access")):

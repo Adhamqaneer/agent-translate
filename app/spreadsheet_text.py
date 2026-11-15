@@ -25,7 +25,7 @@ WORKER_MEMORY_BYTES = 256 * 1024 * 1024
 WORKER_CPU_SECONDS = 15
 _WORKER_CODE = (
     "import json,sys;sys.path[:]=json.loads(sys.argv[1]);"
-    "from spreadsheet_text import _worker_main;_worker_main()"
+    "from app.spreadsheet_text import _worker_main;_worker_main()"
 )
 _CELL_REFERENCE = re.compile(r"([A-Za-z]+)([1-9][0-9]*)\Z")
 _TABLE_NS = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"

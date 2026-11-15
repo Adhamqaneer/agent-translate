@@ -6,25 +6,13 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-import attachments
+from app import attachment_types, attachments
 
 
-API_KEY = "private-attachment-key"
-SOURCE = "Please confirm our appointment tomorrow at 10."
-TRANSLATION = "ممكن تأكدلي موعدنا بكرا الساعة 10؟"
-
-
-def extraction_response(text=SOURCE, target="ar", complete=True, **changes):
-    result = {"text": text, "target_language": target, "complete": complete}
-    payload = {"status": "completed", "steps": [{"type": "model_output", "content": [{
-        "type": "text", "text": json.dumps(result, ensure_ascii=False),
-    }]}]}
-    payload.update(changes)
-    return payload
-
-
-def translation_response(text=TRANSLATION, finish="STOP"):
-    return {"candidates": [{"finishReason": finish, "content": {"parts": [{"text": text}]}}]}
+from tests.fixtures import (
+    ATTACHMENT_API_KEY as API_KEY, ATTACHMENT_SOURCE as SOURCE,
+    ATTACHMENT_TRANSLATION as TRANSLATION, extraction_response, translation_response,
+)
 
 
 class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
@@ -41,11 +29,11 @@ class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
         def fake_client(**kwargs):
             return client_factory(transport=httpx.MockTransport(handler), **kwargs)
 
-        with patch("attachments.httpx.AsyncClient", side_effect=fake_client):
+        with patch("app.attachments.httpx.AsyncClient", side_effect=fake_client):
             return await attachments.translate_attachment(data, mime_type)
 
     async def test_supported_native_images_documents_and_text_use_expected_blocks(self):
-        native_and_text = attachments.SUPPORTED_MIME_TYPES - attachments.SPREADSHEET_MIME_TYPES - attachments.RTF_MIME_TYPES
+        native_and_text = attachment_types.SUPPORTED_MIME_TYPES - attachments.SPREADSHEET_MIME_TYPES - attachments.RTF_MIME_TYPES
         for mime_type in sorted(native_and_text):
             with self.subTest(mime_type=mime_type):
                 requests = []
@@ -266,7 +254,7 @@ class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path == "/v1beta/interactions":
                 return httpx.Response(200, json=extraction_response())
             return httpx.Response(200, json=translation_response())
-        with patch("retry_http.asyncio.sleep", new_callable=AsyncMock):
+        with patch("app.retry_http.asyncio.sleep", new_callable=AsyncMock):
             self.assertEqual(await self.call(recover), [TRANSLATION])
         self.assertEqual(attempts[0].content, attempts[1].content)
 
@@ -277,7 +265,7 @@ class AttachmentTranslationTests(unittest.IsolatedAsyncioTestCase):
                     if failure is httpx.ConnectError:
                         raise httpx.ConnectError(API_KEY + " private-source", request=request)
                     return failure
-                with patch("retry_http.asyncio.sleep", new_callable=AsyncMock):
+                with patch("app.retry_http.asyncio.sleep", new_callable=AsyncMock):
                     with self.assertLogs(attachments.logger, level="ERROR") as recorded:
                         with self.assertRaises(attachments.AttachmentError) as caught:
                             await self.call(handler)
