@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import hmac
 from datetime import datetime, timedelta, timezone
@@ -314,7 +315,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.reply_patch.start()
         self.addCleanup(self.reply_patch.stop)
         self.audio_reply = AsyncMock()
-        self.audio_reply_patch = patch("whatsapp.reply_with_audio_url", self.audio_reply)
+        self.audio_reply_patch = patch("whatsapp.transcribe_and_reply", self.audio_reply)
         self.audio_reply_patch.start()
         self.addCleanup(self.audio_reply_patch.stop)
         self.client = httpx.AsyncClient(
@@ -381,10 +382,10 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
                 self.audio_reply.reset_mock()
                 response = await self.post_event(self.audio_event(voice=voice))
                 self.assertEqual(response.status_code, 200)
-                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, MEDIA_URL)
+                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID)
         self.reply.assert_not_awaited()
 
-    async def test_audio_without_webhook_url_can_use_media_lookup(self):
+    async def test_audio_without_webhook_url_routes_to_transcription(self):
         for present in (False, True):
             with self.subTest(null_url=present):
                 self.audio_reply.reset_mock()
@@ -396,7 +397,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
                     audio.pop("url")
                 response = await self.post_event(event)
                 self.assertEqual(response.status_code, 200)
-                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID, None)
+                self.audio_reply.assert_awaited_once_with(TEST_SENDER, MEDIA_ID)
         self.reply.assert_not_awaited()
 
     async def test_audio_retains_signature_allowlist_and_phone_filters(self):
@@ -423,7 +424,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             response = await self.post_event(event)
         self.assertEqual(response.status_code, 200)
         self.reply.assert_awaited_once_with(TEST_SENDER, "translate this")
-        self.audio_reply.assert_awaited_once_with(SECOND_SENDER, MEDIA_ID, MEDIA_URL)
+        self.audio_reply.assert_awaited_once_with(SECOND_SENDER, MEDIA_ID)
 
     async def test_malformed_audio_prevents_all_work_in_mixed_batch(self):
         invalid_audio = [
@@ -555,6 +556,133 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                     with self.assertRaises(RuntimeError):
                         await translator.translate("synthetic input", client, api_key="unit-test-key")
+
+
+class AudioTranslationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_signed_audio_webhook_downloads_transcribes_translates_and_replies(self):
+        audio = b"OggS-private-synthetic-voice"
+        encoded_audio = base64.b64encode(audio).decode()
+        transcript = "private transcript: please send the address when you have time"
+        translation = "ابعتلي العنوان لما تفضى."
+        steps = []
+        client_factory = httpx.AsyncClient
+
+        def gemini_result(text):
+            return httpx.Response(200, json={"candidates": [{
+                "finishReason": "STOP", "content": {"parts": [{"text": text}]},
+            }]})
+
+        async def handler(request):
+            if request.url.host == "graph.facebook.com" and request.method == "GET":
+                steps.append("metadata")
+                self.assertEqual(request.url.path, f"/{whatsapp.VERSION}/{MEDIA_ID}")
+                self.assertEqual(dict(request.url.params), {"phone_number_id": whatsapp.PHONE_ID})
+                self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+                return httpx.Response(200, json={"url": MEDIA_URL, "mime_type": "audio/ogg"})
+            if request.url.host == "lookaside.fbsbx.com":
+                steps.append("audio")
+                self.assertEqual(request.method, "GET")
+                self.assertEqual(str(request.url), MEDIA_URL)
+                self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+                return httpx.Response(200, content=audio, headers={"Content-Type": "audio/ogg"})
+            if request.url.host == "generativelanguage.googleapis.com":
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(request.headers["x-goog-api-key"], os.environ["GEMINI_API_KEY"])
+                payload = json.loads(request.content)
+                parts = [part for content in payload["contents"] for part in content["parts"]]
+                audio_parts = [part["inlineData"] for part in parts if "inlineData" in part]
+                if audio_parts:
+                    steps.append("stt")
+                    self.assertEqual(len(audio_parts), 1)
+                    self.assertEqual(audio_parts[0]["mimeType"], "audio/ogg")
+                    self.assertEqual(audio_parts[0]["data"], encoded_audio)
+                    return gemini_result(json.dumps({"transcript": transcript}))
+                steps.append("translation")
+                self.assertEqual(payload["contents"], [{"role": "user", "parts": [{"text": transcript}]}])
+                self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], translator.INSTRUCTIONS)
+                return gemini_result(translation)
+            self.assertEqual(str(request.url), whatsapp.MESSAGES_URL)
+            self.assertEqual(request.method, "POST")
+            steps.append("reply")
+            self.assertEqual(request.headers["authorization"], f"Bearer {whatsapp.ACCESS_TOKEN}")
+            payload = json.loads(request.content)
+            self.assertEqual(payload["to"], SECOND_SENDER)
+            self.assertEqual(payload["type"], "text")
+            self.assertEqual(payload["text"]["body"], translation)
+            self.assertIs(payload["text"].get("preview_url", False), False)
+            if steps.count("reply") == 1:
+                return httpx.Response(429, json={})
+            return httpx.Response(200, json={"messages": [{"id": "synthetic-translated-voice"}]})
+
+        def fake_client(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(handler)
+            return client_factory(**kwargs)
+
+        # The webhook-supplied URL is deliberately different: audio retrieval
+        # must use newly fetched metadata rather than trust this URL.
+        event = {"entry": [{"changes": [{"field": "messages", "value": {
+            "metadata": {"phone_number_id": whatsapp.PHONE_ID},
+            "messages": [{"from": SECOND_SENDER, "type": "audio", "audio": {
+                "id": MEDIA_ID, "url": "https://untrusted.example/ignore-this", "voice": True,
+            }}],
+        }}]}]}
+        body = json.dumps(event).encode()
+        signature = "sha256=" + hmac.new(whatsapp.APP_SECRET, body, hashlib.sha256).hexdigest()
+        async with client_factory(transport=httpx.ASGITransport(app=whatsapp.app), base_url="http://test.invalid") as client:
+            with patch("whatsapp.httpx.AsyncClient", side_effect=fake_client), patch("retry_http.asyncio.sleep", new_callable=AsyncMock):
+                with patch.object(whatsapp, "ALLOWED_SENDERS", frozenset({TEST_SENDER, SECOND_SENDER})):
+                    with self.assertLogs(whatsapp.logger, level="INFO") as recorded:
+                        response = await client.post(
+                            "/webhook/whatsapp", content=body, headers={"X-Hub-Signature-256": signature},
+                        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(steps, ["metadata", "audio", "stt", "translation", "reply", "reply"])
+        output = "\n".join(recorded.output)
+        for private in (transcript, encoded_audio, audio.decode(), os.environ["GEMINI_API_KEY"],
+                        whatsapp.ACCESS_TOKEN, MEDIA_URL):
+            self.assertNotIn(private, output)
+
+    async def test_failed_audio_stages_send_one_fallback_without_leaking_content(self):
+        audio = b"OggS-private-failure-voice"
+        transcript = "private-failure-transcript"
+        private_details = transcript + " " + os.environ["GEMINI_API_KEY"] + " " + MEDIA_URL
+        request = httpx.Request("POST", "https://generativelanguage.googleapis.com/private")
+        rejected = httpx.Response(401, request=request, json={"error": {"message": private_details}})
+        failures = [
+            ("download", whatsapp.HTTPException(status_code=502, detail=private_details)),
+            ("stt", httpx.HTTPStatusError(private_details, request=request, response=rejected)),
+            ("stt", httpx.ReadTimeout(private_details, request=request)),
+            ("stt", ValueError(private_details)),
+            ("stt", RuntimeError(private_details)),
+            ("translation", RuntimeError(private_details)),
+        ]
+        for stage, error in failures:
+            with self.subTest(stage=stage, error=type(error).__name__):
+                download = AsyncMock(return_value=(audio, "audio/ogg"))
+                stt = AsyncMock(return_value=transcript)
+                translate = AsyncMock(return_value="unused-translation")
+                {"download": download, "stt": stt, "translation": translate}[stage].side_effect = error
+                with patch("whatsapp.download_audio", download), patch("whatsapp.transcribe_audio", stt):
+                    with patch("whatsapp.translate_message", translate), patch("whatsapp.send_text", new_callable=AsyncMock) as send:
+                        with self.assertLogs(whatsapp.logger, level="ERROR") as recorded:
+                            await whatsapp.transcribe_and_reply(SECOND_SENDER, MEDIA_ID)
+                download.assert_awaited_once_with(MEDIA_ID)
+                if stage == "download":
+                    stt.assert_not_awaited()
+                else:
+                    stt.assert_awaited_once_with(audio, "audio/ogg")
+                if stage != "translation":
+                    translate.assert_not_awaited()
+                else:
+                    translate.assert_awaited_once_with(transcript)
+                send.assert_awaited_once()
+                recipient, fallback = send.await_args.args
+                self.assertEqual(recipient, SECOND_SENDER)
+                self.assertTrue(any("\u0600" <= letter <= "\u06ff" for letter in fallback))
+                output = "\n".join(recorded.output) + fallback
+                for private in (transcript, audio.decode(), base64.b64encode(audio).decode(),
+                                os.environ["GEMINI_API_KEY"], whatsapp.ACCESS_TOKEN, MEDIA_URL):
+                    self.assertNotIn(private, output)
 
 
 class AudioUrlTests(unittest.IsolatedAsyncioTestCase):

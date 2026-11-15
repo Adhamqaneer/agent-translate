@@ -12,6 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 
 from retry_http import post_with_retry, response_error
+from stt import transcribe_audio
 from translator import translate_message
 
 
@@ -90,16 +91,10 @@ def build_audio_link(media_id: str) -> str:
     return f"{base}/media/audio/{media_id}?expires={expires}&signature={signature}"
 
 
-@app.get("/media/audio/{media_id}")
-async def serve_audio(media_id: str, expires: int, signature: str):
+async def download_audio(media_id: str) -> tuple[bytes, str]:
+    """Fetch bounded audio bytes using server-side Meta credentials."""
     if not re.fullmatch(r"[0-9]+", media_id):
-        raise HTTPException(status_code=403, detail="Invalid audio link")
-    expected = _audio_signature(media_id, expires).encode()
-    if not hmac.compare_digest(signature.encode(), expected):
-        raise HTTPException(status_code=403, detail="Invalid audio link")
-    if expires <= time.time():
-        raise HTTPException(status_code=410, detail="Audio link expired. Send the voice note again.")
-
+        raise HTTPException(status_code=400, detail="Invalid audio media ID")
     try:
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
@@ -146,7 +141,21 @@ async def serve_audio(media_id: str, expires: int, signature: str):
         logger.error("Audio download returned an invalid response")
         raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
 
-    return Response(content=bytes(content), media_type=mime_type, headers={
+    return bytes(content), mime_type
+
+
+@app.get("/media/audio/{media_id}")
+async def serve_audio(media_id: str, expires: int, signature: str):
+    if not re.fullmatch(r"[0-9]+", media_id):
+        raise HTTPException(status_code=403, detail="Invalid audio link")
+    expected = _audio_signature(media_id, expires).encode()
+    if not hmac.compare_digest(signature.encode(), expected):
+        raise HTTPException(status_code=403, detail="Invalid audio link")
+    if expires <= time.time():
+        raise HTTPException(status_code=410, detail="Audio link expired. Send the voice note again.")
+
+    content, mime_type = await download_audio(media_id)
+    return Response(content=content, media_type=mime_type, headers={
         "Content-Disposition": f'inline; filename="voice-{media_id}.{AUDIO_EXTENSIONS[mime_type]}"',
         "Cache-Control": "no-store",
         "Referrer-Policy": "no-referrer",
@@ -237,7 +246,7 @@ async def receive_webhook(request: Request, tasks: BackgroundTasks):
         if message.text is not None:
             tasks.add_task(translate_and_reply, message.sender, message.text)
         else:
-            tasks.add_task(reply_with_audio_url, message.sender, message.media_id, message.media_url)
+            tasks.add_task(transcribe_and_reply, message.sender, message.media_id)
     return {"ok": True}
 
 
@@ -253,6 +262,30 @@ async def translate_and_reply(recipient: str, text: str) -> None:
     except (ValueError, RuntimeError) as error:
         logger.error("Translation could not complete (%s)", type(error).__name__)
         reply = "ما قدرت أترجم الرسالة. جرّب نص أقصر وتأكد من إعدادات Gemini."
+
+    await send_text(recipient, reply)
+
+
+async def transcribe_and_reply(recipient: str, media_id: str) -> None:
+    stage = "download"
+    try:
+        audio, mime_type = await download_audio(media_id)
+        stage = "transcription"
+        transcript = await transcribe_audio(audio, mime_type)
+        stage = "translation"
+        reply = await translate_message(transcript)
+    except HTTPException as error:
+        logger.error("Voice download failed (HTTP %s)", error.status_code)
+        reply = "ما قدرت أحمل الفويس. جرّب تبعته كمان مرة."
+    except httpx.HTTPStatusError as error:
+        logger.error("Voice %s rejected (HTTP %s)", stage, error.response.status_code)
+        reply = "تعذرت معالجة الفويس حاليًا. جرّب كمان شوي."
+    except httpx.RequestError as error:
+        logger.error("Voice %s connection failed (%s)", stage, type(error).__name__)
+        reply = "خدمة معالجة الفويس تأخرت. جرّب كمان شوي."
+    except (ValueError, RuntimeError) as error:
+        logger.error("Voice %s could not complete (%s)", stage, type(error).__name__)
+        reply = "ما قدرت أفرّغ الفويس أو أترجمه. جرّب تسجيل أوضح وأقصر."
 
     await send_text(recipient, reply)
 

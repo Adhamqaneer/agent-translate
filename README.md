@@ -7,6 +7,7 @@ meaning, tone, names, numbers, and dates. Formal messages remain formal.
 
 ```text
 WhatsApp -> Meta webhook -> FastAPI -> Gemini -> WhatsApp reply
+Voice note -> Meta audio download -> Gemini STT -> Gemini translation -> WhatsApp text
 ```
 
 Only allowlisted senders' text and audio messages are accepted. Each translation is
@@ -15,25 +16,42 @@ answers or extra commentary. Mixed input follows
 its main language; balanced mixed input defaults to English. Use `ar:` or `en:`
 at the start of a message to select the output language explicitly.
 
-For voice notes and other audio messages, the bot replies to the sender with
-an HTTPS link on the bot's own service, with link previews disabled. Open this
-link in a browser to play or download the voice note without supplying a token.
-Each link is signed and expires after 15 minutes. Anyone holding the link can
-access that one audio file until it expires. Send the voice note again to receive
-a new link. Changing `META_APP_SECRET` also invalidates previously issued links.
+For voice notes and other supported audio messages, the bot downloads the audio
+from Meta, transcribes it in its original language, and passes the transcript to
+the existing Arabic-English translator. The sender receives the translation
+as a normal WhatsApp text message. The transcript is internal; spoken questions
+and commands are translated, not answered or executed. Text messages keep their
+existing translation behavior. No separate agent framework or STT provider is
+required: both transcription and translation use the existing Gemini API key.
+See [Gemini's transcription support](https://aistudio.google.com/docs/models/gemini-3.1-flash-lite).
 
-When the link is opened, the server looks up a fresh media URL using `audio.id`,
-downloads the audio with its existing `WA_ACCESS_TOKEN`, and returns the audio
-bytes to the browser. The token stays on the server. Downloads are limited to
-16 MiB, approved Meta media hosts, and supported audio types. Responses disable
-caching. Audio is held briefly in memory; it is not saved to disk, transcribed,
-or translated. Meta's original URLs still require token authentication; see
+Audio downloads use `audio.id` to retrieve a fresh media URL and authenticate
+with `WA_ACCESS_TOKEN`, which stays on the server. Downloads are limited to
+16 MiB, approved Meta media hosts, and supported audio types. The application
+does not write audio or transcripts to disk or logs. Meta's original URLs require token
+authentication; see
 [Meta's media documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/business-phone-numbers/media).
 
-On Render, the bot uses the automatically provided `RENDER_EXTERNAL_URL`.
-For a custom domain or HTTPS tunnel, set `PUBLIC_BASE_URL` to the public HTTPS
-origin (for example, `https://bot.example.com`), without a path or query string.
-The bot never builds links from the incoming Host header. See
+WhatsApp OGG/Opus voice notes, AAC, MPEG/MP3, and MP4/M4A audio are supported
+for transcription. AMR is not transcribed; no automatic audio conversion is
+installed. Silence, unintelligible speech, or incomplete transcription produces
+a short fallback reply instead of an invented translation.
+
+Audio smaller than 12 MiB is sent inline to Gemini. Larger audio, up to the
+16 MiB download limit, uses a temporary Gemini Files API upload. The application
+requests deletion of that upload after processing, including when processing
+fails. If deletion fails, it logs a generic cleanup warning; remote retention
+then follows [Gemini's Files API policy](https://aistudio.google.com/docs/files).
+
+The previous signed playback endpoint and link helper remain available for
+debugging, but voice replies now contain the translation instead of a link.
+Playback links expire after 15 minutes; anyone holding a link can access that
+one audio file until it expires. Changing `META_APP_SECRET` invalidates old links.
+Playback responses disable caching. On Render, the link helper uses the
+automatically provided `RENDER_EXTERNAL_URL`. For a custom domain or HTTPS
+tunnel, set `PUBLIC_BASE_URL` to the public HTTPS origin (for example,
+`https://bot.example.com`), without a path or query string. This setting is
+not needed for voice transcription. Links never use the incoming Host header. See
 [Render's default environment variables](https://render.com/docs/environment-variables).
 
 ## Files
@@ -42,8 +60,10 @@ The bot never builds links from the incoming Host header. See
 | --- | --- |
 | `whatsapp.py` | Webhook routes, signature validation, sender filtering, and replies. |
 | `translator.py` | Prompt, Gemini translation, shared configuration, and CLI. |
+| `stt.py` | Gemini speech-to-text, audio input handling, and transcription validation. |
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
 | `test_app.py` | Offline retry, pipeline, and webhook tests. |
+| `test_stt.py` | Offline transcription API and response-validation tests. |
 | `requirements.txt` | Pinned direct dependencies. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
 
@@ -75,7 +95,8 @@ when running the virtual environment's Python executable directly.
 | `WA_VERIFY_TOKEN` | A secret you choose and enter identically in Meta's webhook form. |
 | `GEMINI_API_KEY` | Gemini API key. |
 | `GEMINI_MODEL` | Optional; defaults to `gemini-3.1-flash-lite`. |
-| `PUBLIC_BASE_URL` | Optional on Render; otherwise required for audio links. Public HTTPS origin of this service. Overrides `RENDER_EXTERNAL_URL`. |
+| `GEMINI_STT_MODEL` | Optional transcription model; defaults to `GEMINI_MODEL` or `gemini-3.1-flash-lite`. Must support audio input. Uses the same `GEMINI_API_KEY`. |
+| `PUBLIC_BASE_URL` | Optional; public HTTPS origin for playback links only. Overrides `RENDER_EXTERNAL_URL`. Not required for voice translation. |
 
 To allow multiple people, set this in your local `.env` or the host's environment
 settings (these are example numbers):
@@ -128,8 +149,9 @@ Tests use placeholder credentials and mocked HTTP transports. They cover retry
 limits and waits, permanent errors, uncertain sends, malformed responses,
 signature verification, sender configuration, per-sender reply routing,
 concurrent requests, batch validation, audio URL replies and lookups, and `/health`.
-Audio tests also cover signed-link expiry and tampering, token authentication
-on media downloads, untrusted download hosts, and download size/type limits.
+Audio tests also cover the download/transcription/translation/reply pipeline,
+signed-link expiry and tampering, token authentication on media downloads,
+untrusted download hosts, and download size/type limits.
 
 ## Reliability and scope
 
@@ -148,6 +170,10 @@ on media downloads, untrusted download hosts, and download size/type limits.
   one metadata lookup and one audio download, with no automatic retries.
   Expired/invalid links do not make upstream requests. Upstream download failures
   return a generic error; expired links require resending the voice note.
+- Voice translation normally makes two Gemini calls: transcription, then
+  translation. Failures send one short fallback reply when possible; a failed
+  download or transcription does not proceed to translation. Sending retries
+  reuse the completed translation rather than processing the audio again.
 - This version handles allowlisted senders and text/audio messages only. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous
