@@ -8,13 +8,44 @@ meaning, tone, names, numbers, and dates. Formal messages remain formal.
 ```text
 WhatsApp -> Meta webhook -> FastAPI -> Gemini -> WhatsApp reply
 Voice note -> Meta audio download -> Gemini STT -> translation -> Gemini TTS -> WhatsApp voice
+Image/document -> Meta media download -> content extraction -> translation -> WhatsApp text
 ```
 
-Only allowlisted senders' text and audio messages are accepted. Each translation is
+Only allowlisted senders' supported text, audio, image, and document messages are accepted. Each translation is
 returned to its sender. Questions and commands are translated as text, with no
 answers or extra commentary. Mixed input follows
 its main language; balanced mixed input defaults to English. Use `ar:` or `en:`
 at the start of a message to select the output language explicitly.
+
+Images and supported documents receive text translations. The bot downloads
+the attachment using its media ID, reads the text with Gemini, and translates
+it using the same style and accuracy instructions as chat messages. Images and
+scanned PDFs use Gemini's visual text reading; Office documents use Gemini's
+document input support. See [Gemini document processing](https://aistudio.google.com/docs/document-processing).
+
+Supported attachments are JPEG, PNG, WebP, PDF, Word (`.doc`/`.docx`), and UTF-8
+plain text (`.txt`, including a UTF-8 BOM). Images are limited to 5 MiB, and other
+documents to 20 MiB. Unsupported types, empty/unreadable files, and incomplete
+extraction receive a short explanatory reply. Captions, filenames, forwarding
+metadata, and advertising fields are not part of the source text or instructions.
+An image's caption is not used as a substitute for reading text inside the image.
+
+One output language is selected from the main language of the entire attachment;
+Arabic content translates to English and English to Arabic. The contents are
+source material: questions and instructions inside files are translated, never
+executed or answered. Extraction is limited to 100,000 characters, and the full
+translation must fit within 200,000 characters and 100 replies. Long translations
+are split into ordered, numbered WhatsApp messages of at most 4096 characters,
+including the numbering. All translation parts are prepared before sending the
+first message. There is no summarization or intentional truncation.
+
+The application holds attachment bytes and extracted text in memory rather than
+writing them to disk. Gemini extraction uses `store: false`; request headers,
+attachment contents, and translated text are not written to application logs.
+The bot retrieves fresh media metadata, checks the MIME type and size, and
+downloads only from approved Meta hosts. If an outgoing text part fails or its
+acceptance is uncertain, remaining parts stop; already sent parts are not retried
+as a batch. There is no persistent resume queue.
 
 For voice notes and other supported audio messages, the bot downloads the audio
 from Meta, transcribes it in its original language, and passes the transcript to
@@ -50,8 +81,8 @@ authentication; see
 [Meta's media documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/business-phone-numbers/media).
 
 WhatsApp OGG/Opus voice notes, AAC, MPEG/MP3, and MP4/M4A audio are supported
-for transcription. AMR is not transcribed; no automatic audio conversion is
-installed. Silence, unintelligible speech, or incomplete transcription produces
+for transcription. AMR is not transcribed; incoming audio is not automatically
+transcoded. Silence, unintelligible speech, or incomplete transcription produces
 a short fallback reply instead of an invented translation.
 
 Audio smaller than 12 MiB is sent inline to Gemini. Larger audio, up to the
@@ -79,10 +110,13 @@ not needed for voice transcription. Links never use the incoming Host header. Se
 | `translator.py` | Prompt, Gemini translation, shared configuration, and CLI. |
 | `stt.py` | Gemini speech-to-text, audio input handling, and transcription validation. |
 | `tts.py` | Gemini text-to-speech and in-memory OGG/Opus encoding. |
+| `attachments.py` | Image/document text extraction, complete translation, and ordered text replies. |
 | `retry_http.py` | Retry policies and waiting times for both APIs. |
 | `test_app.py` | Offline retry, pipeline, and webhook tests. |
 | `test_stt.py` | Offline transcription API and response-validation tests. |
 | `test_tts.py` | Offline speech generation, encoder lifecycle, and real encoding smoke tests. |
+| `test_attachments.py` | Offline extraction, file formats, chunking, and translation tests. |
+| `test_attachments_app.py` | Attachment webhook routing, authenticated downloads, and text delivery tests. |
 | `requirements.txt` | Pinned direct dependencies. |
 | `.gitignore` | Excludes local settings, virtual environments, caches, and logs. |
 
@@ -115,6 +149,7 @@ when running the virtual environment's Python executable directly.
 | `GEMINI_API_KEY` | Gemini API key. |
 | `GEMINI_MODEL` | Optional; defaults to `gemini-3.1-flash-lite`. |
 | `GEMINI_STT_MODEL` | Optional transcription model; defaults to `GEMINI_MODEL` or `gemini-3.1-flash-lite`. Must support audio input. Uses the same `GEMINI_API_KEY`. |
+| `GEMINI_ATTACHMENT_MODEL` | Optional attachment-reading/translation model; defaults to `GEMINI_MODEL` or `gemini-3.1-flash-lite`. Must support image/document input and structured extraction. Uses the same `GEMINI_API_KEY`. |
 | `GEMINI_TTS_MODEL` | Optional speech-generation model; defaults to `gemini-3.8-flash-tts`. Must support the Interactions TTS format. |
 | `GEMINI_TTS_VOICE` | Optional prebuilt Gemini voice; defaults to `Puck`. Other supported voices include `Kore`, `Zephyr`, and `Charon`. |
 | `PUBLIC_BASE_URL` | Optional; public HTTPS origin for playback links only. Overrides `RENDER_EXTERNAL_URL`. Not required for voice translation. |
@@ -177,6 +212,10 @@ Speech-generation requests are mocked; an encoder smoke test uses the bundled
 ffmpeg to verify real mono OGG/Opus output. Voice delivery tests cover multipart
 uploads, `voice: true`, upload/send retries, and text fallback after definite
 failures while avoiding duplicate replies after uncertain sends.
+Attachment tests cover image/document routing, safe authenticated downloads,
+complete extraction, one language across all chunks, ordered numbered replies,
+and stopping after an unsuccessful or unconfirmed text send. Gemini extraction
+and translation are mocked; no private files are sent during tests.
 
 ## Reliability and scope
 
@@ -200,7 +239,7 @@ failures while avoiding duplicate replies after uncertain sends.
   not proceed to later stages. TTS/encoding/upload failures reuse the translation
   as a text fallback. Temporary voice-send rejections reuse the uploaded media ID;
   retries do not repeat transcription, translation, synthesis, or upload.
-- This version handles allowlisted senders and text/audio messages only. There is no database,
+- This version handles allowlisted senders and supported text/audio/image/document messages. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous
   translations when accuracy matters.

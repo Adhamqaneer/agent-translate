@@ -511,7 +511,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_target_events_are_ignored(self):
         events = [self.event(sender="10000000000"), self.event(phone_id="999"),
-                  self.event(message_type="image"), self.event(text="   "),
+                  self.event(message_type="video"), self.event(text="   "),
                   {"entry": [{"changes": [{"field": "messages", "value": {
                       "metadata": {"phone_number_id": whatsapp.PHONE_ID}, "statuses": [],
                   }}]}]}]

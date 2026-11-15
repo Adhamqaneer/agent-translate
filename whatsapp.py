@@ -11,6 +11,10 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 
+from attachments import (
+    IMAGE_MIME_TYPES, MAX_ATTACHMENT_BYTES, MAX_IMAGE_BYTES,
+    SUPPORTED_MIME_TYPES, translate_attachment,
+)
 from retry_http import SAFE_CONNECTION_ERRORS, post_with_retry, response_error
 from stt import transcribe_audio
 from tts import synthesize_speech
@@ -59,6 +63,7 @@ class IncomingMessage:
     text: str | None = None
     media_id: str | None = None
     media_url: str | None = None
+    media_kind: str = "audio"
 
 
 def _valid_media_url(value: object) -> bool:
@@ -93,10 +98,12 @@ def build_audio_link(media_id: str) -> str:
     return f"{base}/media/audio/{media_id}?expires={expires}&signature={signature}"
 
 
-async def download_audio(media_id: str) -> tuple[bytes, str]:
-    """Fetch bounded audio bytes using server-side Meta credentials."""
+async def _download_media(
+    media_id: str, *, allowed_types: frozenset[str], max_bytes: int, kind: str,
+) -> tuple[bytes, str]:
+    """Fetch bounded media from trusted Meta metadata, never a webhook URL."""
     if not re.fullmatch(r"[0-9]+", media_id):
-        raise HTTPException(status_code=400, detail="Invalid audio media ID")
+        raise HTTPException(status_code=400, detail="Invalid media ID")
     try:
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
@@ -111,39 +118,61 @@ async def download_audio(media_id: str) -> tuple[bytes, str]:
             media_url = payload.get("url")
             mime_type = payload.get("mime_type")
             if not _valid_media_url(media_url) or not isinstance(mime_type, str):
-                raise ValueError("Invalid audio metadata")
+                raise ValueError("Invalid media metadata")
             mime_type = mime_type.split(";", 1)[0].strip().lower()
-            if mime_type not in AUDIO_EXTENSIONS:
-                raise ValueError("Unsupported audio type")
+            if mime_type not in allowed_types:
+                if kind == "audio":
+                    raise ValueError("Unsupported audio type")
+                raise HTTPException(status_code=415, detail="Unsupported media type")
+            limit = min(max_bytes, MAX_IMAGE_BYTES) if mime_type in IMAGE_MIME_TYPES else max_bytes
+            file_size = payload.get("file_size")
+            if file_size is not None and int(file_size) > limit:
+                raise HTTPException(status_code=413, detail="Media file is too large")
             download_url = httpx.URL(media_url)
             if download_url.host not in MEDIA_DOWNLOAD_HOSTS or download_url.port not in {None, 443}:
                 raise ValueError("Untrusted media download URL")
-            async with client.stream("GET", media_url, headers=headers) as audio:
-                audio.raise_for_status()
-                content_type = audio.headers.get("content-type", mime_type).split(";", 1)[0].strip().lower()
-                if content_type not in AUDIO_EXTENSIONS and content_type != "application/octet-stream":
-                    raise ValueError("Unexpected audio content type")
-                content_length = audio.headers.get("content-length")
-                if content_length is not None and int(content_length) > MAX_AUDIO_BYTES:
-                    raise HTTPException(status_code=413, detail="Audio file is too large")
+            async with client.stream("GET", media_url, headers=headers) as media:
+                media.raise_for_status()
+                content_type = media.headers.get("content-type", mime_type).split(";", 1)[0].strip().lower()
+                if content_type not in {mime_type, "application/octet-stream"}:
+                    raise ValueError("Unexpected media content type")
+                content_length = media.headers.get("content-length")
+                if content_length is not None and int(content_length) > limit:
+                    raise HTTPException(status_code=413, detail="Media file is too large")
                 content = bytearray()
-                async for chunk in audio.aiter_bytes():
-                    if len(content) + len(chunk) > MAX_AUDIO_BYTES:
-                        raise HTTPException(status_code=413, detail="Audio file is too large")
+                async for chunk in media.aiter_bytes():
+                    if len(content) + len(chunk) > limit:
+                        raise HTTPException(status_code=413, detail="Media file is too large")
                     content.extend(chunk)
         if not content:
-            raise ValueError("Empty audio response")
+            raise ValueError("Empty media response")
     except httpx.HTTPStatusError as error:
-        logger.error("Meta rejected audio download (HTTP %s)", error.response.status_code)
-        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
+        logger.error("Meta rejected %s download (HTTP %s)", kind, error.response.status_code)
+        raise HTTPException(status_code=502, detail="Could not load media. Try again later.") from error
     except httpx.RequestError as error:
-        logger.error("Audio download connection failed (%s)", type(error).__name__)
-        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
-    except ValueError as error:
-        logger.error("Audio download returned an invalid response")
-        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
+        logger.error("%s download connection failed (%s)", kind, type(error).__name__)
+        raise HTTPException(status_code=502, detail="Could not load media. Try again later.") from error
+    except (ValueError, TypeError) as error:
+        logger.error("%s download returned an invalid response", kind)
+        raise HTTPException(status_code=502, detail="Could not load media. Try again later.") from error
 
     return bytes(content), mime_type
+
+
+async def download_audio(media_id: str) -> tuple[bytes, str]:
+    return await _download_media(
+        media_id, allowed_types=frozenset(AUDIO_EXTENSIONS), max_bytes=MAX_AUDIO_BYTES, kind="audio",
+    )
+
+
+async def download_attachment(media_id: str, media_kind: str) -> tuple[bytes, str]:
+    if media_kind not in {"image", "document"}:
+        raise HTTPException(status_code=415, detail="Unsupported attachment kind")
+    return await _download_media(
+        media_id, allowed_types=IMAGE_MIME_TYPES if media_kind == "image" else SUPPORTED_MIME_TYPES,
+        max_bytes=MAX_IMAGE_BYTES if media_kind == "image" else MAX_ATTACHMENT_BYTES,
+        kind="attachment",
+    )
 
 
 @app.get("/media/audio/{media_id}")
@@ -219,15 +248,16 @@ def _incoming_messages(event: object) -> list[IncomingMessage]:
                         raise ValueError("Expected webhook text")
                     if text.strip():
                         incoming.append(IncomingMessage(sender, text=text))
-                elif message.get("type") == "audio":
-                    audio = as_object(message.get("audio"))
-                    media_id = audio.get("id")
-                    media_url = audio.get("url")
+                elif message.get("type") in ("audio", "image", "document"):
+                    media_kind = message["type"]
+                    media = as_object(message.get(media_kind))
+                    media_id = media.get("id")
+                    media_url = media.get("url")
                     if not isinstance(media_id, str) or not re.fullmatch(r"[0-9]+", media_id):
-                        raise ValueError("Expected audio media ID")
+                        raise ValueError("Expected media ID")
                     if media_url is not None and not _valid_media_url(media_url):
-                        raise ValueError("Expected audio media URL")
-                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url))
+                        raise ValueError("Expected media URL")
+                    incoming.append(IncomingMessage(sender, media_id=media_id, media_url=media_url, media_kind=media_kind))
     return incoming
 
 
@@ -247,8 +277,10 @@ async def receive_webhook(request: Request, tasks: BackgroundTasks):
     for message in incoming:
         if message.text is not None:
             tasks.add_task(translate_and_reply, message.sender, message.text)
-        else:
+        elif message.media_kind == "audio":
             tasks.add_task(transcribe_and_reply, message.sender, message.media_id)
+        else:
+            tasks.add_task(translate_attachment_and_reply, message.sender, message.media_id, message.media_kind)
     return {"ok": True}
 
 
@@ -301,6 +333,35 @@ async def transcribe_and_reply(recipient: str, media_id: str) -> None:
     await send_text(recipient, reply)
 
 
+async def translate_attachment_and_reply(recipient: str, media_id: str, media_kind: str) -> None:
+    try:
+        data, mime_type = await download_attachment(media_id, media_kind)
+        parts = await translate_attachment(data, mime_type)
+        if (not isinstance(parts, list) or not parts
+                or any(not isinstance(part, str) or not part.strip() or len(part) > 4096 for part in parts)):
+            raise RuntimeError("Invalid attachment translation")
+    except HTTPException as error:
+        logger.error("Attachment download failed (HTTP %s)", error.status_code)
+        if error.status_code == 415:
+            reply = "هالصيغة مش مدعومة حاليًا. ابعث صورة أو PDF أو Word أو ملف TXT."
+        elif error.status_code == 413:
+            reply = "الملف كبير. ابعث صورة أصغر من 5 ميغابايت أو مستند أصغر من 20 ميغابايت."
+        else:
+            reply = "ما قدرت أحمل الصورة أو الملف. جرّب تبعته كمان مرة."
+    except httpx.HTTPError as error:
+        logger.error("Attachment translation connection failed (%s)", type(error).__name__)
+        reply = "تعذرت ترجمة الصورة أو الملف حاليًا. جرّب كمان شوي."
+    except (ValueError, RuntimeError) as error:
+        logger.error("Attachment translation could not complete (%s)", type(error).__name__)
+        reply = "ما قدرت أقرأ النص كامل أو أترجمه. تأكد إن الملف واضح وبيحتوي نص، أو ابعته على أجزاء."
+    else:
+        for part in parts:
+            if not await send_text(recipient, part, log_details=False):
+                break
+        return
+    await send_text(recipient, reply, log_details=False)
+
+
 async def reply_with_audio_url(
     recipient: str, media_id: str, media_url: str | None = None,
 ) -> None:
@@ -328,7 +389,7 @@ def _error_summary(details: dict, recipient: str, text: str) -> str:
     return " ".join(description.split())[:500]
 
 
-async def send_text(recipient: str, text: str) -> None:
+async def send_text(recipient: str, text: str, *, log_details: bool = True) -> bool:
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await post_with_retry(
@@ -344,14 +405,28 @@ async def send_text(recipient: str, text: str) -> None:
                 },
             )
             response.raise_for_status()
+            payload = response.json()
+            messages = payload.get("messages") if isinstance(payload, dict) else None
+            if (not isinstance(messages, list) or not messages or not isinstance(messages[0], dict)
+                    or not isinstance(messages[0].get("id"), str) or not messages[0]["id"].strip()):
+                raise ValueError("Unconfirmed text reply")
             logger.info("WhatsApp accepted the outgoing reply")
+            return True
     except httpx.HTTPStatusError as error:
         details = response_error(error.response)
-        logger.error("Meta rejected the reply (HTTP %s, code %s, subcode %s): %s",
-                     error.response.status_code, details.get("code"), details.get("error_subcode"),
-                     _error_summary(details, recipient, text))
+        if log_details:
+            logger.error("Meta rejected the reply (HTTP %s, code %s, subcode %s): %s",
+                         error.response.status_code, details.get("code"), details.get("error_subcode"),
+                         _error_summary(details, recipient, text))
+        else:
+            code = details.get("code")
+            code = code if isinstance(code, int) and not isinstance(code, bool) else None
+            logger.error("Meta rejected attachment text reply (HTTP %s, code %s)", error.response.status_code, code)
     except httpx.RequestError as error:
         logger.error("WhatsApp reply was not confirmed (%s)", type(error).__name__)
+    except ValueError:
+        logger.error("Meta returned an unconfirmed text reply response")
+    return False
 
 
 async def send_voice(recipient: str, audio: bytes) -> str:
