@@ -16,17 +16,25 @@ its main language; balanced mixed input defaults to English. Use `ar:` or `en:`
 at the start of a message to select the output language explicitly.
 
 For voice notes and other audio messages, the bot replies to the sender with
-Meta's actual temporary media URL as text. It uses `audio.url` from the webhook
-when present; otherwise, it retrieves the URL using `audio.id` and the existing
-WhatsApp access token. Audio is not downloaded, stored, transcribed, or translated.
-The reply contains the URL only, with link previews disabled.
+an HTTPS link on the bot's own service, with link previews disabled. Open this
+link in a browser to play or download the voice note without supplying a token.
+Each link is signed and expires after 15 minutes. Anyone holding the link can
+access that one audio file until it expires. Send the voice note again to receive
+a new link. Changing `META_APP_SECRET` also invalidates previously issued links.
 
-This is an initial media-link test, not a public audio player. Meta's URLs expire
-after five minutes and downloading the audio requires an
-`Authorization: Bearer <WA_ACCESS_TOKEN>` header. Opening the URL in a normal
-browser, or passing it to a tool that cannot supply this header, will not work.
-The bot does not include the access token in the reply. See
+When the link is opened, the server looks up a fresh media URL using `audio.id`,
+downloads the audio with its existing `WA_ACCESS_TOKEN`, and returns the audio
+bytes to the browser. The token stays on the server. Downloads are limited to
+16 MiB, approved Meta media hosts, and supported audio types. Responses disable
+caching. Audio is held briefly in memory; it is not saved to disk, transcribed,
+or translated. Meta's original URLs still require token authentication; see
 [Meta's media documentation](https://developers.facebook.com/documentation/business-messaging/whatsapp/business-phone-numbers/media).
+
+On Render, the bot uses the automatically provided `RENDER_EXTERNAL_URL`.
+For a custom domain or HTTPS tunnel, set `PUBLIC_BASE_URL` to the public HTTPS
+origin (for example, `https://bot.example.com`), without a path or query string.
+The bot never builds links from the incoming Host header. See
+[Render's default environment variables](https://render.com/docs/environment-variables).
 
 ## Files
 
@@ -67,6 +75,7 @@ when running the virtual environment's Python executable directly.
 | `WA_VERIFY_TOKEN` | A secret you choose and enter identically in Meta's webhook form. |
 | `GEMINI_API_KEY` | Gemini API key. |
 | `GEMINI_MODEL` | Optional; defaults to `gemini-3.1-flash-lite`. |
+| `PUBLIC_BASE_URL` | Optional on Render; otherwise required for audio links. Public HTTPS origin of this service. Overrides `RENDER_EXTERNAL_URL`. |
 
 To allow multiple people, set this in your local `.env` or the host's environment
 settings (these are example numbers):
@@ -119,6 +128,8 @@ Tests use placeholder credentials and mocked HTTP transports. They cover retry
 limits and waits, permanent errors, uncertain sends, malformed responses,
 signature verification, sender configuration, per-sender reply routing,
 concurrent requests, batch validation, audio URL replies and lookups, and `/health`.
+Audio tests also cover signed-link expiry and tampering, token authentication
+on media downloads, untrusted download hosts, and download size/type limits.
 
 ## Reliability and scope
 
@@ -133,8 +144,10 @@ concurrent requests, batch validation, audio URL replies and lookups, and `/heal
 - Retrying a send reuses the translation. Translation failures produce a short
   fallback reply when possible. Logs report status codes and error types rather
   than message text or credentials. API acceptance does not confirm delivery.
-- Audio URL lookup makes one GET request when the webhook has no media URL.
-  Lookup failures produce a short fallback reply; the audio itself is never fetched.
+- Audio links are created without downloading media. Opening a valid link makes
+  one metadata lookup and one audio download, with no automatic retries.
+  Expired/invalid links do not make upstream requests. Upstream download failures
+  return a generic error; expired links require resending the voice note.
 - This version handles allowlisted senders and text/audio messages only. There is no database,
   persistent queue, or webhook deduplication. Restarts can interrupt pending
   tasks, and repeated webhook events can be processed again. Review ambiguous

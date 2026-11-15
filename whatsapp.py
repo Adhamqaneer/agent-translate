@@ -4,11 +4,12 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 
 from retry_http import post_with_retry, response_error
 from translator import translate_message
@@ -40,6 +41,13 @@ if not (
     raise RuntimeError("Check the WhatsApp settings in .env before starting the server.")
 
 MESSAGES_URL = f"https://graph.facebook.com/{VERSION}/{PHONE_ID}/messages"
+AUDIO_LINK_TTL = 15 * 60
+MAX_AUDIO_BYTES = 16 * 1024 * 1024
+MEDIA_DOWNLOAD_HOSTS = frozenset({"lookaside.fbsbx.com", "lookaside.facebook.com"})
+AUDIO_EXTENSIONS = {
+    "audio/aac": "aac", "audio/amr": "amr", "audio/mpeg": "mp3",
+    "audio/mp4": "m4a", "audio/ogg": "ogg",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +68,90 @@ def _valid_media_url(value: object) -> bool:
     except httpx.InvalidURL:
         return False
     return url.scheme == "https" and bool(url.host) and not url.userinfo
+
+
+def _audio_signature(media_id: str, expires: int) -> str:
+    payload = f"audio:{media_id}:{expires}".encode()
+    return hmac.new(APP_SECRET, payload, hashlib.sha256).hexdigest()
+
+
+def build_audio_link(media_id: str) -> str:
+    if not re.fullmatch(r"[0-9]+", media_id):
+        raise ValueError("Invalid audio media ID")
+    base = (os.getenv("PUBLIC_BASE_URL", "").strip()
+            or os.getenv("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
+    if not _valid_media_url(base):
+        raise ValueError("Set PUBLIC_BASE_URL to the service's public HTTPS origin")
+    url = httpx.URL(base)
+    if url.path not in {"", "/"} or url.query or url.fragment:
+        raise ValueError("PUBLIC_BASE_URL must be an HTTPS origin without a path or query")
+    expires = int(time.time()) + AUDIO_LINK_TTL
+    signature = _audio_signature(media_id, expires)
+    return f"{base}/media/audio/{media_id}?expires={expires}&signature={signature}"
+
+
+@app.get("/media/audio/{media_id}")
+async def serve_audio(media_id: str, expires: int, signature: str):
+    if not re.fullmatch(r"[0-9]+", media_id):
+        raise HTTPException(status_code=403, detail="Invalid audio link")
+    expected = _audio_signature(media_id, expires).encode()
+    if not hmac.compare_digest(signature.encode(), expected):
+        raise HTTPException(status_code=403, detail="Invalid audio link")
+    if expires <= time.time():
+        raise HTTPException(status_code=410, detail="Audio link expired. Send the voice note again.")
+
+    try:
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            metadata = await client.get(
+                f"https://graph.facebook.com/{VERSION}/{media_id}",
+                params={"phone_number_id": PHONE_ID}, headers=headers,
+            )
+            metadata.raise_for_status()
+            payload = metadata.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid media metadata")
+            media_url = payload.get("url")
+            mime_type = payload.get("mime_type")
+            if not _valid_media_url(media_url) or not isinstance(mime_type, str):
+                raise ValueError("Invalid audio metadata")
+            mime_type = mime_type.split(";", 1)[0].strip().lower()
+            if mime_type not in AUDIO_EXTENSIONS:
+                raise ValueError("Unsupported audio type")
+            download_url = httpx.URL(media_url)
+            if download_url.host not in MEDIA_DOWNLOAD_HOSTS or download_url.port not in {None, 443}:
+                raise ValueError("Untrusted media download URL")
+            async with client.stream("GET", media_url, headers=headers) as audio:
+                audio.raise_for_status()
+                content_type = audio.headers.get("content-type", mime_type).split(";", 1)[0].strip().lower()
+                if content_type not in AUDIO_EXTENSIONS and content_type != "application/octet-stream":
+                    raise ValueError("Unexpected audio content type")
+                content_length = audio.headers.get("content-length")
+                if content_length is not None and int(content_length) > MAX_AUDIO_BYTES:
+                    raise HTTPException(status_code=413, detail="Audio file is too large")
+                content = bytearray()
+                async for chunk in audio.aiter_bytes():
+                    if len(content) + len(chunk) > MAX_AUDIO_BYTES:
+                        raise HTTPException(status_code=413, detail="Audio file is too large")
+                    content.extend(chunk)
+        if not content:
+            raise ValueError("Empty audio response")
+    except httpx.HTTPStatusError as error:
+        logger.error("Meta rejected audio download (HTTP %s)", error.response.status_code)
+        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
+    except httpx.RequestError as error:
+        logger.error("Audio download connection failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
+    except ValueError as error:
+        logger.error("Audio download returned an invalid response")
+        raise HTTPException(status_code=502, detail="Could not load audio. Try again later.") from error
+
+    return Response(content=bytes(content), media_type=mime_type, headers={
+        "Content-Disposition": f'inline; filename="voice-{media_id}.{AUDIO_EXTENSIONS[mime_type]}"',
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 @app.get("/health")
@@ -168,29 +260,11 @@ async def translate_and_reply(recipient: str, text: str) -> None:
 async def reply_with_audio_url(
     recipient: str, media_id: str, media_url: str | None = None,
 ) -> None:
-    """Return Meta's temporary URL only; do not download or transcribe audio."""
+    """Return a signed browser link; keep Meta's access token on the server."""
     try:
-        if media_url is None:
-            async with httpx.AsyncClient(timeout=15) as client:
-                response = await client.get(
-                    f"https://graph.facebook.com/{VERSION}/{media_id}",
-                    params={"phone_number_id": PHONE_ID},
-                    headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-                )
-                response.raise_for_status()
-                payload = response.json()
-            media_url = payload.get("url") if isinstance(payload, dict) else None
-        if not _valid_media_url(media_url):
-            raise ValueError("Invalid audio media URL")
-        reply = media_url
-    except httpx.HTTPStatusError as error:
-        logger.error("Meta rejected audio URL lookup (HTTP %s)", error.response.status_code)
-        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
-    except httpx.RequestError as error:
-        logger.error("Audio URL lookup connection failed (%s)", type(error).__name__)
-        reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
+        reply = build_audio_link(media_id)
     except ValueError:
-        logger.error("Audio URL lookup returned an invalid response")
+        logger.error("Audio link could not be created; check the public service URL")
         reply = "ما قدرت أجيب رابط الفويس حاليًا. جرّب كمان شوي."
 
     await send_text(recipient, reply)
