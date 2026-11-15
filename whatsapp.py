@@ -343,7 +343,7 @@ async def translate_attachment_and_reply(recipient: str, media_id: str, media_ki
     except HTTPException as error:
         logger.error("Attachment download failed (HTTP %s)", error.status_code)
         if error.status_code == 415:
-            reply = "هالصيغة مش مدعومة حاليًا. ابعث صورة أو PDF أو Word أو ملف TXT."
+            reply = "هالصيغة مش مدعومة حاليًا. ابعث صورة أو PDF أو Word أو PowerPoint أو ملف TXT."
         elif error.status_code == 413:
             reply = "الملف كبير. ابعث صورة أصغر من 5 ميغابايت أو مستند أصغر من 20 ميغابايت."
         else:

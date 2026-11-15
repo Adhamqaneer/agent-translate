@@ -23,12 +23,14 @@ it using the same style and accuracy instructions as chat messages. Images and
 scanned PDFs use Gemini's visual text reading; Office documents use Gemini's
 document input support. See [Gemini document processing](https://aistudio.google.com/docs/document-processing).
 
-Supported attachments are JPEG, PNG, WebP, PDF, Word (`.doc`/`.docx`), and UTF-8
-plain text (`.txt`, including a UTF-8 BOM). Images are limited to 5 MiB, and other
+Supported attachments are JPEG, PNG, WebP, PDF, Word (`.doc`/`.docx`), PowerPoint
+(`.ppt`/`.pptx`), and UTF-8 plain text (`.txt`, including a UTF-8 BOM). Images are limited to 5 MiB, and other
 documents to 20 MiB. Unsupported types, empty/unreadable files, and incomplete
 extraction receive a short explanatory reply. Captions, filenames, forwarding
 metadata, and advertising fields are not part of the source text or instructions.
 An image's caption is not used as a substitute for reading text inside the image.
+PowerPoint text is read in slide order and returned as text translations; no
+translated presentation file is generated.
 
 One output language is selected from the main language of the entire attachment;
 Arabic content translates to English and English to Arabic. The contents are

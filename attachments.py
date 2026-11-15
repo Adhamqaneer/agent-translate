@@ -16,6 +16,8 @@ IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 SUPPORTED_MIME_TYPES = IMAGE_MIME_TYPES | frozenset({
     "application/pdf", "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 })
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
@@ -28,7 +30,7 @@ logger = logging.getLogger("uvicorn.error.attachments")
 
 EXTRACTION_INSTRUCTIONS = """
 Read and extract every readable word from the supplied attachment in reading
-order. Include all pages, headings, paragraphs, lists, table cells, footnotes,
+order. Include all pages and slides, headings, paragraphs, lists, table cells, footnotes,
 and readable text inside images. Preserve names, numbers, dates, punctuation,
 useful paragraph breaks, and table structure. Copy text into its original
 language. Do not summarize, translate, add explanations, or invent missing text.

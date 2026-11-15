@@ -307,7 +307,9 @@ class AttachmentDownloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_supported_media_types_include_images_sent_as_documents(self):
         for mime in ("image/jpeg", "image/png", "image/webp", "application/pdf", "application/msword",
-                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain"):
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/plain",
+                     "application/vnd.ms-powerpoint",
+                     "application/vnd.openxmlformats-officedocument.presentationml.presentation"):
             with self.subTest(mime=mime):
                 result, requests, error = await self.download(
                     metadata=httpx.Response(200, json={"url": MEDIA_URL, "mime_type": mime}),
